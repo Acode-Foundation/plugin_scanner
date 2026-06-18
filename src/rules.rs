@@ -298,6 +298,15 @@ pub fn classify_call(
             callee,
             Confidence::High,
         ),
+        "acode.define" | "window.acode.define" => context.add(
+            "acode.define_module",
+            Severity::Medium,
+            Category::PersistenceOrHooks,
+            Some(span),
+            "Plugin defines an Acode module/API for other plugins",
+            first_arg_string.unwrap_or(callee),
+            Confidence::High,
+        ),
         "acode.addIntentHandler" | "window.acode.addIntentHandler" => context.add(
             "persistence.intent_handler",
             Severity::Medium,
@@ -610,6 +619,15 @@ fn classify_acode_require(context: &mut RuleContext<'_>, span: Span, module_name
             Some(span),
             "Acode terminal module import",
             "terminal",
+            Confidence::High,
+        ),
+        Some("acodex") => context.add(
+            "acode.require_acodex",
+            Severity::Medium,
+            Category::PersistenceOrHooks,
+            Some(span),
+            "Community plugin API import through Acode module registry",
+            "acodex",
             Confidence::High,
         ),
         Some("intent") => context.add(

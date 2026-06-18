@@ -268,6 +268,12 @@ mod tests {
     }
 
     #[test]
+    fn detects_acode_plugin_defined_modules() {
+        let ids = finding_ids("acode.define('myPluginApi', { run() {} });");
+        assert!(ids.contains(&"acode.define_module".to_string()));
+    }
+
+    #[test]
     fn detects_storage_and_cookie_access() {
         let ids = finding_ids("localStorage.x = document.cookie; indexedDB.open('x');");
         assert!(ids.contains(&"storage.local_storage".to_string()));

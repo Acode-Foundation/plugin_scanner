@@ -24,6 +24,10 @@ plugin_scanner scan plugin.zip --format json
 # Markdown report
 plugin_scanner scan plugin.zip --markdown
 plugin_scanner scan plugin.zip --format md
+
+# Concise user-facing Markdown capability summary
+plugin_scanner scan plugin.zip --summary
+plugin_scanner scan plugin.zip --format summary
 ```
 
 Use `--all-js` to scan every JavaScript-like file in the archive. Without it,
@@ -71,11 +75,18 @@ JavaScript checks:
   sensitive storage constants, `localStorage`, cookies
 - persistence and hooks: plugin init/unmount hooks, global mutation, command and
   formatter registration, event and intent handlers
+- Acode module registry usage: `acode.require(...)` imports, including modules
+  exported by Acode or by other plugins, and `acode.define(...)` APIs exposed by
+  the scanned plugin for other plugins to import
 - obfuscation: very long minified lines, base64-like blobs, decoder APIs, hex
   payload arrays
 
 The rules are intentionally explainable. Findings describe risky capability use
 and include severity, confidence, category, file, span, message, and evidence.
+Severity is a capability-risk signal, not proof that a plugin is malicious.
+Use `--summary` when you want a compact disclosure of APIs/capabilities a user
+should know about; use `--markdown` or `--json` when you need the full audit
+trail with every raw finding.
 
 ## Development
 

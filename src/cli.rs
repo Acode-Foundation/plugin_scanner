@@ -13,13 +13,13 @@ pub struct Cli {
 pub enum Command {
     #[command(group(
 		ArgGroup::new("output_format")
-			.args(["format", "json", "markdown", "terminal"])
+			.args(["format", "json", "markdown", "summary", "terminal"])
 			.multiple(false)
 	))]
     Scan {
         /// Path to the plugin zip archive.
         zip: PathBuf,
-        /// Output format: terminal, json, or md.
+        /// Output format: terminal, json, md, or summary.
         #[arg(long, value_enum)]
         format: Option<OutputFormat>,
         /// Emit JSON.
@@ -28,6 +28,9 @@ pub enum Command {
         /// Emit a human-readable Markdown report.
         #[arg(long, short = 'm')]
         markdown: bool,
+        /// Emit a concise Markdown capability summary for end users.
+        #[arg(long)]
+        summary: bool,
         /// Emit a terminal-friendly table report.
         #[arg(long, short = 't')]
         terminal: bool,
@@ -45,15 +48,25 @@ pub enum OutputFormat {
     Json,
     #[value(alias = "markdown")]
     Md,
+    #[value(alias = "md-summary", alias = "markdown-summary")]
+    Summary,
     Terminal,
 }
 
 impl OutputFormat {
-    pub fn from_flags(format: Option<Self>, json: bool, markdown: bool, terminal: bool) -> Self {
+    pub fn from_flags(
+        format: Option<Self>,
+        json: bool,
+        markdown: bool,
+        summary: bool,
+        terminal: bool,
+    ) -> Self {
         if let Some(format) = format {
             format
         } else if json {
             Self::Json
+        } else if summary {
+            Self::Summary
         } else if markdown {
             Self::Md
         } else {

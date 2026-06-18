@@ -48,10 +48,11 @@ fn run(cli: Cli) -> Result<(Report, OutputFormat), archive::ArchiveError> {
             format,
             json,
             markdown,
+            summary,
             terminal,
             all_js,
         } => {
-            let format = OutputFormat::from_flags(format, json, markdown, terminal);
+            let format = OutputFormat::from_flags(format, json, markdown, summary, terminal);
             scan_zip(&zip, ScanOptions { all_js }).map(|report| (report, format))
         }
     }
@@ -62,6 +63,7 @@ fn render_report(report: &Report, format: OutputFormat) -> Result<String, String
         OutputFormat::Json => serde_json::to_string_pretty(report)
             .map_err(|error| format!("failed to serialize JSON report: {error}")),
         OutputFormat::Md => Ok(markdown::render_markdown(report)),
+        OutputFormat::Summary => Ok(markdown::render_markdown_summary(report)),
         OutputFormat::Terminal => Ok(terminal::render_terminal(report)),
     }
 }
@@ -295,6 +297,27 @@ mod tests {
         let output = render_report(&report, OutputFormat::Md).unwrap();
         assert!(output.contains("# Plugin Scan Report"));
         assert!(output.contains("network.fetch"));
+    }
+
+    #[test]
+    fn renders_markdown_summary_report() {
+        let report = scan_fixture(&[
+			(
+				"plugin.json",
+				br#"{"id":"com.example.summary","name":"Summary","main":"main.js","version":"1.0.0"}"#,
+			),
+			(
+				"main.js",
+				b"const terminal = acode.require('terminal'); Executor.execute('ls'); system.writeText('x');",
+			),
+		]);
+        let output = render_report(&report, OutputFormat::Summary).unwrap();
+        assert!(output.contains("# Plugin Security Summary"));
+        assert!(output.contains("Shell command execution"));
+        assert!(output.contains("Relevant code:"));
+        assert!(output.contains("```js"));
+        assert!(output.contains("Executor.execute('ls')"));
+        assert!(!output.contains("## Findings"));
     }
 
     #[test]
