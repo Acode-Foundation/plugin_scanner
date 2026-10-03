@@ -1,7 +1,10 @@
+use std::io::IsTerminal;
+
 use ariadne::{Color, Config, IndexType, Label, Report as AriadneReport, ReportKind, sources};
 
 use crate::{
-    report::{Finding, Report},
+    markdown::recommendation_label,
+    report::{Finding, Recommendation, Report},
     severity::Severity,
 };
 
@@ -10,102 +13,144 @@ const EXCERPT_CONTEXT_CHARS: usize = 40;
 const MAX_HIGHLIGHT_CHARS: usize = 64;
 
 pub fn render_terminal(report: &Report) -> String {
-    let mut out = String::new();
-    out.push_str(&summary(report));
+    let mut out = header(report);
 
-    let annotated = sorted_findings(report)
-        .into_iter()
-        .filter(|finding| finding.span.is_some())
-        .take(MAX_ANNOTATED_FINDINGS)
-        .collect::<Vec<_>>();
-
-    if annotated.is_empty() {
-        out.push_str("\nNo source annotations available for these findings.\n");
-        return out;
-    }
-
-    out.push_str("\nAnnotated findings:\n\n");
-    for finding in annotated {
-        if let Some(rendered) = render_finding(report, finding) {
-            out.push_str(&rendered);
-            if !rendered.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-    }
-
-    let annotated_count = report
+    let annotated: Vec<&Finding> = report
         .findings
         .iter()
-        .filter(|finding| finding.span.is_some())
+        .filter(|finding| finding.severity >= Severity::Low)
+        .take(MAX_ANNOTATED_FINDINGS)
+        .collect();
+    if !annotated.is_empty() {
+        out.push_str("\nFindings:\n\n");
+    }
+    for finding in &annotated {
+        match render_finding(report, finding) {
+            Some(rendered) => out.push_str(&rendered),
+            None => out.push_str(&format!(
+                "[{}] {}: {}\n   {} — {}\n",
+                finding.severity.label(),
+                finding.id,
+                finding.message,
+                finding.file.as_deref().unwrap_or("archive"),
+                shorten(&finding.evidence, 160)
+            )),
+        }
+        out.push('\n');
+    }
+
+    let hidden_info = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == Severity::Info)
         .count();
-    if annotated_count > MAX_ANNOTATED_FINDINGS {
+    let remaining = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity >= Severity::Low)
+        .count()
+        .saturating_sub(annotated.len());
+    if remaining > 0 || hidden_info > 0 {
         out.push_str(&format!(
-			"Showing {MAX_ANNOTATED_FINDINGS} of {annotated_count} source annotations. Use --json or --markdown for the full report.\n"
-		));
+            "{remaining} more finding(s) and {hidden_info} info item(s) not shown; use --markdown or --json for everything.\n"
+        ));
     }
 
     if !report.errors.is_empty() {
-        out.push_str("\nScan errors:\n");
-        for error in &report.errors {
+        out.push_str(&format!(
+            "\n{} scan error(s); first: {}\n",
+            report.errors.len(),
+            report.errors[0].message
+        ));
+    }
+    out
+}
+
+fn header(report: &Report) -> String {
+    let mut out = String::from("Plugin Scan Report\n==================\n\n");
+    if let Some(plugin) = &report.plugin {
+        out.push_str(&format!(
+            "Plugin:   {} ({}) {}\n",
+            plugin.name.as_deref().unwrap_or("Unknown"),
+            plugin.id.as_deref().unwrap_or("unknown"),
+            plugin.version.as_deref().unwrap_or("")
+        ));
+        out.push_str(&format!(
+            "Entry:    {}\n",
+            plugin.entry.as_deref().unwrap_or("(none)")
+        ));
+    }
+    out.push_str(&format!(
+        "Analysed: {} JS/HTML file(s), {} installed file(s)\n\n",
+        report.stats.js_files_parsed, report.stats.installed_files
+    ));
+
+    let verdict = &report.verdict;
+    let marker = match verdict.recommendation {
+        Recommendation::Pass => "✔",
+        Recommendation::Review => "!",
+        Recommendation::Block => "✘",
+    };
+    out.push_str(&format!(
+        "{marker} Recommendation: {}   risk: {}{}\n",
+        recommendation_label(verdict.recommendation),
+        verdict.risk.map_or("none", Severity::key),
+        if verdict.complete {
+            ""
+        } else {
+            "   (scan incomplete)"
+        }
+    ));
+    for reason in &verdict.reasons {
+        out.push_str(&format!("  - {reason}\n"));
+    }
+
+    if !report.capabilities.is_empty() {
+        out.push_str("\nCapabilities:\n");
+        for capability in &report.capabilities {
             out.push_str(&format!(
-                "- {}: {}\n",
-                error.file.as_deref().unwrap_or("scanner"),
-                error.message
+                "  {:<8} {:<34} {}\n",
+                capability.severity.key(),
+                capability.title,
+                shorten(&capability.evidence.join(", "), 90)
             ));
         }
     }
 
-    out
-}
-
-fn summary(report: &Report) -> String {
-    let mut out = String::new();
-    out.push_str("Plugin Scan Report\n");
-    out.push_str("==================\n\n");
-
-    if let Some(plugin) = &report.plugin {
+    let flagged: Vec<_> = report
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.tags.iter().any(|tag| tag != "local"))
+        .collect();
+    let plain = report.endpoints.len() - flagged.len();
+    if !report.endpoints.is_empty() {
         out.push_str(&format!(
-            "Plugin:  {}\n",
-            plugin.name.as_deref().unwrap_or("Unknown")
+            "\nNetwork hosts: {} ({} flagged)\n",
+            report.endpoints.len(),
+            flagged.len()
         ));
-        out.push_str(&format!(
-            "ID:      {}\n",
-            plugin.id.as_deref().unwrap_or("unknown")
-        ));
-        out.push_str(&format!(
-            "Version: {}\n",
-            plugin.version.as_deref().unwrap_or("unknown")
-        ));
-        out.push_str(&format!(
-            "Main:    {}\n",
-            plugin.main.as_deref().unwrap_or("unknown")
-        ));
-    }
-
-    out.push_str(&format!("Files:   {}\n", report.stats.files_scanned));
-    out.push_str(&format!("JS:      {}\n", report.stats.js_files_parsed));
-    out.push_str(&format!("Findings: {}\n\n", report.summary.total_findings));
-
-    if !report.summary.by_severity.is_empty() {
-        out.push_str("Severity: ");
-        for severity in ["critical", "high", "medium", "low", "info"] {
-            if let Some(count) = report.summary.by_severity.get(severity) {
-                out.push_str(&format!("{severity}={count} "));
-            }
+        for endpoint in flagged {
+            out.push_str(&format!(
+                "  ! {} [{}]\n",
+                endpoint.host,
+                endpoint.tags.join(", ")
+            ));
         }
-        out.push('\n');
-    }
-
-    if !report.summary.by_category.is_empty() {
-        out.push_str("Categories: ");
-        for (category, count) in &report.summary.by_category {
-            out.push_str(&format!("{category}={count} "));
+        if plain > 0 {
+            let names: Vec<_> = report
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.tags.is_empty())
+                .take(8)
+                .map(|endpoint| endpoint.host.as_str())
+                .collect();
+            out.push_str(&format!(
+                "  {}{}\n",
+                names.join(", "),
+                if plain > names.len() { ", …" } else { "" }
+            ));
         }
-        out.push('\n');
     }
-
     out
 }
 
@@ -114,29 +159,44 @@ fn render_finding(report: &Report, finding: &Finding) -> Option<String> {
     let span = finding.span?;
     let source = report.sources.get(file)?;
     let excerpt = excerpt_for_span(source, span.start_byte, span.end_byte)?;
-    let file_id = file.to_string();
+    // Ariadne positions are relative to the excerpt, so label it as one; the
+    // real location is in the note.
+    let file_id = format!("{file} (excerpt)");
+    let range = excerpt.highlight_start..excerpt.highlight_end;
+    let occurrences = if finding.occurrences > 1 {
+        format!(", {} occurrences", finding.occurrences)
+    } else {
+        String::new()
+    };
 
     let mut bytes = Vec::new();
-    let kind = report_kind(finding.severity);
-    let color = severity_color(finding.severity);
-    let range = excerpt.highlight_start..excerpt.highlight_end;
-    AriadneReport::build(kind, (file_id.clone(), range.clone()))
-        .with_config(Config::default().with_index_type(IndexType::Byte))
-        .with_code(&finding.id)
-        .with_message(format!("{:?}: {}", finding.severity, finding.message))
-        .with_label(
-            Label::new((file_id.clone(), range))
-                .with_color(color)
-                .with_message(shorten(&finding.evidence, 120)),
-        )
-        .with_note(format!(
-            "location={}:{}:{}, category={:?}, confidence={:?}",
-            file, span.start_line, span.start_column, finding.category, finding.confidence
-        ))
-        .finish()
-        .write_for_stdout(sources([(file_id, excerpt.source.as_str())]), &mut bytes)
-        .ok()?;
-
+    AriadneReport::build(
+        report_kind(finding.severity),
+        (file_id.clone(), range.clone()),
+    )
+    .with_config(
+        Config::default()
+            .with_index_type(IndexType::Byte)
+            .with_color(std::io::stdout().is_terminal()),
+    )
+    .with_code(&finding.id)
+    .with_message(format!("{}: {}", finding.severity.label(), finding.message))
+    .with_label(
+        Label::new((file_id.clone(), range))
+            .with_color(severity_color(finding.severity))
+            .with_message(shorten(&finding.evidence, 120)),
+    )
+    .with_note(format!(
+        "{}:{}:{} · {} · {:?} confidence{occurrences}",
+        file,
+        span.start_line,
+        span.start_column,
+        finding.category.key(),
+        finding.confidence
+    ))
+    .finish()
+    .write_for_stdout(sources([(file_id, excerpt.source.as_str())]), &mut bytes)
+    .ok()?;
     String::from_utf8(bytes).ok()
 }
 
@@ -150,24 +210,22 @@ fn excerpt_for_span(source: &str, start: usize, end: usize) -> Option<SourceExce
     if source.is_empty() {
         return None;
     }
-
-    let start = previous_char_boundary(source, start.min(source.len()));
-    let mut end = next_char_boundary(source, end.min(source.len()));
+    let start = floor_boundary(source, start.min(source.len()));
+    let mut end = ceil_boundary(source, end.min(source.len()));
     if end <= start {
-        end = next_char_boundary(source, (start + 1).min(source.len()));
+        end = ceil_boundary(source, (start + 1).min(source.len()));
     }
     if end <= start {
         return None;
     }
-
     let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
     let line_end = source[end..]
         .find('\n')
         .map_or(source.len(), |index| end + index);
 
-    let highlight_end = move_forward_chars(source, start, end, MAX_HIGHLIGHT_CHARS);
-    let excerpt_start = move_back_chars(source, line_start, start, EXCERPT_CONTEXT_CHARS);
-    let excerpt_end = move_forward_chars(source, highlight_end, line_end, EXCERPT_CONTEXT_CHARS);
+    let highlight_end = forward_chars(source, start, end, MAX_HIGHLIGHT_CHARS);
+    let excerpt_start = back_chars(source, line_start, start, EXCERPT_CONTEXT_CHARS);
+    let excerpt_end = forward_chars(source, highlight_end, line_end, EXCERPT_CONTEXT_CHARS);
 
     let prefix = if excerpt_start > line_start {
         "..."
@@ -175,86 +233,47 @@ fn excerpt_for_span(source: &str, start: usize, end: usize) -> Option<SourceExce
         ""
     };
     let suffix = if excerpt_end < line_end { "..." } else { "" };
+    let text = format!("{prefix}{}{suffix}", &source[excerpt_start..excerpt_end]);
 
-    let mut excerpt = String::new();
-    excerpt.push_str(prefix);
-    excerpt.push_str(&source[excerpt_start..excerpt_end]);
-    excerpt.push_str(suffix);
-
-    let offset = prefix.len();
-    let highlight_start = offset + start.saturating_sub(excerpt_start);
-    let mut highlight_end = offset + highlight_end.saturating_sub(excerpt_start);
+    let highlight_start = prefix.len() + (start - excerpt_start);
+    let mut highlight_end = prefix.len() + (highlight_end - excerpt_start);
     if highlight_end <= highlight_start {
-        highlight_end = (highlight_start + 1).min(excerpt.len());
+        highlight_end = (highlight_start + 1).min(text.len());
     }
-
     Some(SourceExcerpt {
-        source: excerpt,
+        source: text,
         highlight_start,
         highlight_end,
     })
 }
 
-fn previous_char_boundary(source: &str, mut index: usize) -> usize {
+fn floor_boundary(source: &str, mut index: usize) -> usize {
     while index > 0 && !source.is_char_boundary(index) {
         index -= 1;
     }
     index
 }
 
-fn next_char_boundary(source: &str, mut index: usize) -> usize {
+fn ceil_boundary(source: &str, mut index: usize) -> usize {
     while index < source.len() && !source.is_char_boundary(index) {
         index += 1;
     }
     index
 }
 
-fn move_back_chars(source: &str, min_index: usize, mut index: usize, max_chars: usize) -> usize {
-    for _ in 0..max_chars {
-        if index <= min_index {
-            return min_index;
-        }
-        index = source[min_index..index]
-            .char_indices()
-            .last()
-            .map_or(min_index, |(offset, _)| min_index + offset);
-    }
-    index
+fn back_chars(source: &str, min: usize, index: usize, count: usize) -> usize {
+    source[min..index]
+        .char_indices()
+        .rev()
+        .nth(count.saturating_sub(1))
+        .map_or(min, |(offset, _)| min + offset)
 }
 
-fn move_forward_chars(source: &str, mut index: usize, max_index: usize, max_chars: usize) -> usize {
-    for _ in 0..max_chars {
-        if index >= max_index {
-            return max_index;
-        }
-        index = source[index..max_index]
-            .chars()
-            .next()
-            .map_or(max_index, |ch| index + ch.len_utf8());
-    }
-    index
-}
-
-fn sorted_findings(report: &Report) -> Vec<&Finding> {
-    let mut findings: Vec<_> = report.findings.iter().collect();
-    findings.sort_by_key(|finding| {
-        (
-            severity_rank(finding.severity),
-            finding.file.as_deref().unwrap_or(""),
-            finding.id.as_str(),
-        )
-    });
-    findings
-}
-
-fn severity_rank(severity: Severity) -> u8 {
-    match severity {
-        Severity::Critical => 0,
-        Severity::High => 1,
-        Severity::Medium => 2,
-        Severity::Low => 3,
-        Severity::Info => 4,
-    }
+fn forward_chars(source: &str, index: usize, max: usize, count: usize) -> usize {
+    source[index..max]
+        .char_indices()
+        .nth(count)
+        .map_or(max, |(offset, _)| index + offset)
 }
 
 fn report_kind(severity: Severity) -> ReportKind<'static> {
@@ -279,7 +298,7 @@ fn shorten(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let shortened: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
-        format!("{shortened}...")
+        format!("{shortened}…")
     } else {
         shortened
     }

@@ -1,24 +1,31 @@
-use serde::Deserialize;
+//! plugin.json handling that mirrors Acode's installer and the acode.app
+//! publish checks (`server/apis/plugin.js`).
+
+use serde_json::{Map, Value};
 
 use crate::{
-    archive::{PluginArchive, is_unsafe_path, normalize_zip_path},
-    report::{PluginSummary, Report, ScanError},
-    severity::{Category, Confidence, Severity},
+    archive::{ArchiveFile, PluginArchive, extension, sanitize_zip_path},
+    report::{Finding, PluginSummary, Report},
+    severity::{Category, Severity},
 };
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+const MAX_ICON_BYTES: usize = 50 * 1024;
+const MIN_PRICE: f64 = 10.0;
+const MAX_PRICE: f64 = 10_000.0;
+
+#[derive(Debug, Clone, Default)]
 pub struct PluginManifest {
     pub id: Option<String>,
     pub name: Option<String>,
     pub main: Option<String>,
     pub version: Option<String>,
-    pub readme: Option<String>,
-    pub icon: Option<String>,
-    pub files: Option<Vec<String>>,
-    pub min_version_code: Option<u64>,
+    pub min_version_code: Option<i64>,
     pub price: Option<f64>,
-    pub changelogs: Option<String>,
+    pub permissions: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub repository: Option<String>,
+    /// Installed path of the script Acode will load.
+    pub entry: Option<String>,
 }
 
 impl PluginManifest {
@@ -26,219 +33,385 @@ impl PluginManifest {
         PluginSummary {
             id: self.id.clone(),
             name: self.name.clone(),
-            main: self.main.clone(),
             version: self.version.clone(),
+            main: self.main.clone(),
+            entry: self.entry.clone(),
             min_version_code: self.min_version_code,
             price: self.price,
+            permissions: self.permissions.clone(),
+            dependencies: self.dependencies.clone(),
+            repository: self.repository.clone(),
         }
     }
 }
 
-pub fn load_manifest(archive: &PluginArchive, report: &mut Report) -> Option<PluginManifest> {
-    let Some(file) = archive.file("plugin.json") else {
-        report.add_finding(
+pub fn load(archive: &PluginArchive, report: &mut Report) -> Option<PluginManifest> {
+    // The installer reads `zip.files["plugin.json"]`, an exact-key lookup.
+    let Some(file) = archive.by_key("plugin.json") else {
+        report.push(manifest_finding(
             "manifest.missing",
             Severity::Critical,
-            Category::Manifest,
-            Some("plugin.json".to_string()),
-            None,
-            "Plugin archive is missing plugin.json",
-            "plugin.json is required for Acode plugins",
-            Confidence::High,
-        );
+            "Archive has no top-level plugin.json; Acode refuses to install it",
+            "plugin.json must be at the zip root, not inside a folder",
+        ));
         return None;
     };
 
-    match serde_json::from_slice::<PluginManifest>(&file.bytes) {
-        Ok(manifest) => Some(manifest),
-        Err(error) => {
-            report.errors.push(ScanError {
-                file: Some("plugin.json".to_string()),
-                message: format!("failed to parse plugin.json: {error}"),
-            });
-            report.add_finding(
+    let object = match serde_json::from_slice::<Value>(strip_bom(&file.bytes)) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => {
+            report.push(manifest_finding(
                 "manifest.invalid_json",
                 Severity::Critical,
-                Category::Manifest,
-                Some("plugin.json".to_string()),
-                None,
+                "plugin.json is not a JSON object",
+                "expected `{ ... }`",
+            ));
+            return None;
+        }
+        Err(error) => {
+            report.push(manifest_finding(
+                "manifest.invalid_json",
+                Severity::Critical,
                 "plugin.json is not valid JSON",
                 error.to_string(),
-                Confidence::High,
-            );
-            None
+            ));
+            return None;
         }
-    }
-}
-
-pub fn validate_manifest(
-    manifest: Option<&PluginManifest>,
-    archive: &PluginArchive,
-    report: &mut Report,
-) {
-    let Some(manifest) = manifest else {
-        return;
     };
 
-    require_string("id", manifest.id.as_deref(), report);
-    require_string("name", manifest.name.as_deref(), report);
-    require_string("main", manifest.main.as_deref(), report);
-    require_string("version", manifest.version.as_deref(), report);
+    let mut manifest = PluginManifest {
+        id: string_field(&object, "id"),
+        name: string_field(&object, "name"),
+        main: string_field(&object, "main"),
+        version: string_field(&object, "version"),
+        min_version_code: object.get("minVersionCode").and_then(Value::as_i64),
+        price: object.get("price").and_then(Value::as_f64),
+        permissions: string_list(&object, "permissions"),
+        dependencies: string_list(&object, "dependencies"),
+        repository: match object.get("repository") {
+            Some(Value::String(url)) => Some(url.clone()),
+            Some(Value::Object(repo)) => string_field(repo, "url"),
+            _ => None,
+        },
+        entry: None,
+    };
 
-    let mut referenced = Vec::new();
-    if let Some(main) = manifest.main.as_deref()
-        && (archive.contains(main) || !archive.contains("main.js"))
-    {
-        referenced.push(("main", main));
-    }
-    if let Some(readme) = manifest.readme.as_deref() {
-        referenced.push(("readme", readme));
-    }
-    if let Some(icon) = manifest.icon.as_deref() {
-        referenced.push(("icon", icon));
-    }
-    if let Some(changelogs) = manifest.changelogs.as_deref() {
-        referenced.push(("changelogs", changelogs));
+    validate_fields(&object, &manifest, report);
+    manifest.entry = resolve_entry(&manifest, archive, report);
+    validate_assets(&object, archive, report);
+
+    if !manifest.dependencies.is_empty() {
+        report.push(
+            manifest_finding(
+                "manifest.dependencies",
+                Severity::Low,
+                "Installing this plugin also installs other plugins",
+                manifest.dependencies.join(", "),
+            )
+            .keyed(manifest.dependencies.join(",")),
+        );
     }
 
-    for (field, path) in referenced {
-        validate_referenced_path(field, path, archive, report);
-    }
+    Some(manifest)
+}
 
-    if let Some(files) = &manifest.files {
-        for path in files {
-            validate_referenced_path("files", path, archive, report);
+/// Same logic as installPlugin.js: use `main` if that exact key exists,
+/// otherwise fall back to `main.js`, otherwise the install fails.
+fn resolve_entry(
+    manifest: &PluginManifest,
+    archive: &PluginArchive,
+    report: &mut Report,
+) -> Option<String> {
+    let main = manifest.main.as_deref();
+    let key = match main {
+        Some(main) if archive.by_key(main).is_some() => main,
+        _ if archive.by_key("main.js").is_some() => {
+            if let Some(main) = main {
+                report.push(manifest_finding(
+                    "manifest.main_fallback",
+                    Severity::Info,
+                    "`main` isn't in the zip under that exact name, so Acode loads main.js",
+                    format!("main = {main:?}"),
+                ));
+            }
+            "main.js"
+        }
+        _ => {
+            report.push(manifest_finding(
+                "manifest.no_entrypoint",
+                Severity::Critical,
+                "Neither `main` nor main.js exists in the zip; Acode refuses to install it",
+                format!("main = {:?}", main.unwrap_or("(missing)")),
+            ));
+            return None;
+        }
+    };
+
+    if !matches!(extension(key).as_str(), "js" | "mjs" | "cjs") {
+        report.push(manifest_finding(
+            "manifest.non_js_entry",
+            Severity::Medium,
+            "Entry script doesn't have a .js extension",
+            key.to_string(),
+        ));
+    }
+    Some(sanitize_zip_path(key))
+}
+
+fn validate_fields(object: &Map<String, Value>, manifest: &PluginManifest, report: &mut Report) {
+    for field in ["id", "name", "main", "version"] {
+        if string_field(object, field).is_none_or(|value| value.trim().is_empty()) {
+            report.push(manifest_finding(
+                format!("manifest.missing_{field}"),
+                if field == "main" {
+                    Severity::Medium
+                } else {
+                    Severity::High
+                },
+                format!("plugin.json is missing `{field}`"),
+                "required by acode.app",
+            ));
         }
     }
 
-    if let Some(icon) = manifest.icon.as_deref()
-        && let Some(file) = archive.file(icon)
-        && file.bytes.len() > 50 * 1024
+    if let Some(id) = manifest.id.as_deref()
+        && !is_valid_id(id)
     {
-        report.add_finding(
+        report.push(manifest_finding(
+            "manifest.invalid_id",
+            Severity::Medium,
+            "Plugin id doesn't match acode.app's rule `^[a-z][a-z0-9._]{3,49}$`",
+            id.to_string(),
+        ));
+    }
+
+    if let Some(version) = manifest.version.as_deref()
+        && !is_valid_version(version)
+    {
+        report.push(manifest_finding(
+            "manifest.invalid_version",
+            Severity::Medium,
+            "Version must be `x.y.z` digits to publish on acode.app",
+            version.to_string(),
+        ));
+    }
+
+    if let Some(value) = object.get("minVersionCode")
+        && !value.is_i64()
+    {
+        report.push(manifest_finding(
+            "manifest.invalid_min_version_code",
+            Severity::Medium,
+            "minVersionCode must be a number",
+            value.to_string(),
+        ));
+    }
+
+    if let Some(price) = manifest.price
+        && price != 0.0
+        && !(MIN_PRICE..=MAX_PRICE).contains(&price)
+    {
+        report.push(manifest_finding(
+            "manifest.invalid_price",
+            Severity::Medium,
+            "Price must be between ₹10 and ₹10000 on acode.app",
+            price.to_string(),
+        ));
+    }
+}
+
+fn validate_assets(object: &Map<String, Value>, archive: &PluginArchive, report: &mut Report) {
+    // The installer patches missing icon/readme to these defaults, and the
+    // website rejects uploads where neither exists.
+    let icon = asset(object, archive, "icon", "icon.png");
+    match icon {
+        None => report.push(manifest_finding(
+            "manifest.missing_icon",
+            Severity::Medium,
+            "No icon found (checked `icon` and icon.png); acode.app rejects the upload",
+            "add icon.png",
+        )),
+        Some(file) if file.bytes.len() > MAX_ICON_BYTES => report.push(manifest_finding(
             "manifest.icon_too_large",
             Severity::Low,
-            Category::Manifest,
-            Some(normalize_zip_path(icon)),
-            None,
-            "Plugin icon is larger than the documented limit",
-            format!(
-                "icon size is {} bytes; documented limit is 51200 bytes",
-                file.bytes.len()
-            ),
-            Confidence::High,
-        );
+            "Icon is larger than the documented 50 KB limit",
+            format!("{}: {} bytes", file.path, file.bytes.len()),
+        )),
+        Some(_) => {}
+    }
+
+    if asset(object, archive, "readme", "readme.md").is_none()
+        && archive.by_key("README.md").is_none()
+    {
+        report.push(manifest_finding(
+            "manifest.missing_readme",
+            Severity::Medium,
+            "No readme found (checked `readme` and readme.md); acode.app rejects the upload",
+            "add readme.md",
+        ));
     }
 }
 
-fn require_string(field: &str, value: Option<&str>, report: &mut Report) {
-    if value.is_none_or(|value| value.trim().is_empty()) {
-        report.add_finding(
-            format!("manifest.missing_{field}"),
-            Severity::Critical,
-            Category::Manifest,
-            Some("plugin.json".to_string()),
-            None,
-            format!("plugin.json is missing required field `{field}`"),
-            "required manifest metadata is absent or empty",
-            Confidence::High,
-        );
-    }
+fn asset<'a>(
+    object: &Map<String, Value>,
+    archive: &'a PluginArchive,
+    field: &str,
+    fallback: &str,
+) -> Option<&'a ArchiveFile> {
+    string_field(object, field)
+        .and_then(|path| archive.by_key(&path))
+        .or_else(|| archive.by_key(fallback))
 }
 
-fn validate_referenced_path(field: &str, path: &str, archive: &PluginArchive, report: &mut Report) {
-    let normalized = normalize_zip_path(path);
-    if is_unsafe_path(path) {
-        report.add_finding(
-            "manifest.unsafe_reference",
-            Severity::High,
-            Category::Manifest,
-            Some("plugin.json".to_string()),
-            None,
-            format!("Manifest field `{field}` references an unsafe path"),
-            path.to_string(),
-            Confidence::High,
-        );
-        return;
-    }
+fn manifest_finding(
+    id: impl Into<String>,
+    severity: Severity,
+    message: impl Into<String>,
+    evidence: impl Into<String>,
+) -> Finding {
+    Finding::new(id, severity, Category::Manifest, message, evidence).with_file("plugin.json")
+}
 
-    if !archive.contains(&normalized) {
-        report.add_finding(
-            "manifest.missing_referenced_file",
-            Severity::High,
-            Category::Manifest,
-            Some("plugin.json".to_string()),
-            None,
-            format!("Manifest field `{field}` references a missing file"),
-            normalized,
-            Confidence::High,
-        );
-    }
+fn string_field(object: &Map<String, Value>, field: &str) -> Option<String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn string_list(object: &Map<String, Value>, field: &str) -> Vec<String> {
+    object
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn strip_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)
+}
+
+fn is_valid_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let rest = chars.as_str();
+    first.is_ascii_alphabetic()
+        && (3..=49).contains(&rest.len())
+        && rest
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_')
+}
+
+fn is_valid_version(version: &str) -> bool {
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::archive::PluginArchive;
+    use std::io::{Cursor, Write};
 
-    fn archive(files: Vec<(&str, &[u8])>) -> PluginArchive {
-        PluginArchive {
-            files: files
-                .into_iter()
-                .map(|(name, bytes)| crate::archive::ArchiveFile {
-                    name: name.to_string(),
-                    bytes: bytes.to_vec(),
-                })
-                .collect(),
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    use super::*;
+    use crate::archive::Limits;
+
+    fn load_zip(files: &[(&str, &[u8])]) -> (Option<PluginManifest>, Report) {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            for (name, bytes) in files {
+                writer
+                    .start_file(*name, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
         }
+        cursor.set_position(0);
+        let mut report = Report::new();
+        let archive = PluginArchive::from_reader(cursor, Limits::default(), &mut report).unwrap();
+        (load(&archive, &mut report), report)
     }
 
+    const ICON: (&str, &[u8]) = ("icon.png", b"\x89PNG");
+    const README: (&str, &[u8]) = ("readme.md", b"# x");
+
     #[test]
-    fn accepts_valid_minimal_manifest() {
-        let archive = archive(vec![
+    fn accepts_valid_manifest() {
+        let (manifest, report) = load_zip(&[
             (
                 "plugin.json",
-                br#"{"id":"x","name":"X","main":"main.js","version":"1"}"#,
+                br#"{"id":"com.example.ok","name":"Ok","main":"dist/main.js","version":"1.0.0"}"#,
+            ),
+            ("dist/main.js", b""),
+            ICON,
+            README,
+        ]);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(manifest.unwrap().entry.as_deref(), Some("dist/main.js"));
+    }
+
+    #[test]
+    fn dot_slash_main_falls_back_to_main_js_like_installer() {
+        let (manifest, report) = load_zip(&[
+            (
+                "plugin.json",
+                br#"{"id":"com.example.ok","name":"Ok","main":"./dist/main.js","version":"1.0.0"}"#,
+            ),
+            ("dist/main.js", b"good"),
+            ("main.js", b"other"),
+            ICON,
+            README,
+        ]);
+        assert!(report.has("manifest.main_fallback"));
+        assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
+    }
+
+    #[test]
+    fn missing_entry_is_install_failure() {
+        let (_, report) = load_zip(&[(
+            "plugin.json",
+            br#"{"id":"com.example.ok","name":"Ok","main":"dist/main.js","version":"1.0.0"}"#,
+        )]);
+        assert!(report.has("manifest.no_entrypoint"));
+        assert!(report.has("manifest.missing_icon"));
+        assert!(report.has("manifest.missing_readme"));
+    }
+
+    #[test]
+    fn nested_plugin_json_is_not_found() {
+        let (manifest, report) = load_zip(&[("my-plugin/plugin.json", b"{}")]);
+        assert!(manifest.is_none());
+        assert!(report.has("manifest.missing"));
+    }
+
+    #[test]
+    fn wrong_field_types_do_not_abort_parsing() {
+        let (manifest, report) = load_zip(&[
+            (
+                "plugin.json",
+                br#"{"id":"x","name":"X","main":"main.js","version":"1.0","minVersionCode":"290","permissions":["net"]}"#,
             ),
             ("main.js", b""),
+            ICON,
+            README,
         ]);
-        let mut report = Report::new("test");
-        let manifest = load_manifest(&archive, &mut report);
-        validate_manifest(manifest.as_ref(), &archive, &mut report);
-        assert!(report.findings.is_empty());
-    }
-
-    #[test]
-    fn flags_missing_main_file() {
-        let archive = archive(vec![(
-            "plugin.json",
-            br#"{"id":"x","name":"X","main":"main.js","version":"1"}"#,
-        )]);
-        let mut report = Report::new("test");
-        let manifest = load_manifest(&archive, &mut report);
-        validate_manifest(manifest.as_ref(), &archive, &mut report);
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.id == "manifest.missing_referenced_file")
-        );
-    }
-
-    #[test]
-    fn flags_unsafe_manifest_reference() {
-        let archive = archive(vec![(
-            "plugin.json",
-            br#"{"id":"x","name":"X","main":"../main.js","version":"1"}"#,
-        )]);
-        let mut report = Report::new("test");
-        let manifest = load_manifest(&archive, &mut report);
-        validate_manifest(manifest.as_ref(), &archive, &mut report);
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.id == "manifest.unsafe_reference")
-        );
+        let manifest = manifest.unwrap();
+        assert_eq!(manifest.permissions, vec!["net"]);
+        assert!(report.has("manifest.invalid_id"));
+        assert!(report.has("manifest.invalid_version"));
+        assert!(report.has("manifest.invalid_min_version_code"));
     }
 }
