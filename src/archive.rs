@@ -7,7 +7,9 @@
 //! - rewrites every other name with `sanitizeZipPath`, which turns `\` into
 //!   `/` and *collapses* `..` segments instead of rejecting them, so
 //!   `a/../plugin.json` is written over `plugin.json`,
-//! - looks up `plugin.json` and `main` by exact raw key.
+//! - looks up `plugin.json` and `main` by exact raw key,
+//! - installs every other entry, including `__MACOSX/` and `.DS_Store` ones
+//!   that unzip tools hide.
 //!
 //! Scanning anything other than what lands on disk lets a plugin show the
 //! scanner one file and give users another, so this module keeps both views.
@@ -126,10 +128,8 @@ impl PluginArchive {
             };
             let raw = meta.name.clone();
 
-            if is_os_junk(&raw) {
-                continue;
-            }
-
+            // No skipping `__MACOSX/` or `.DS_Store` here: the installer writes
+            // them like any other entry, so they can carry code.
             if is_unsafe_absolute_path(&raw) {
                 report.push(
                     Finding::new(
@@ -314,6 +314,19 @@ impl PluginArchive {
     fn flag_suspicious_content(&self, report: &mut Report) {
         for file in self.installed_files() {
             let kind = file_kind(&file.path, &file.bytes);
+            if is_os_junk(&file.path) && kind != "metadata" {
+                report.push(
+                    Finding::new(
+                        "archive.metadata_path_content",
+                        Severity::Medium,
+                        Category::Archive,
+                        "File sits in an OS-metadata path that unzip tools and reviewers usually hide, but Acode installs it",
+                        format!("{} ({kind})", file.path),
+                    )
+                    .with_file(file.path.clone())
+                    .keyed(&file.path),
+                );
+            }
             match kind {
                 "native_binary" => report.push(
                     Finding::new(
@@ -371,10 +384,19 @@ impl PluginArchive {
     /// Every distinct piece of JavaScript in the archive, including entries
     /// that get overwritten during install, so nothing hides behind a duplicate.
     pub fn javascript_files(&self) -> Vec<&ArchiveFile> {
+        self.distinct_files(&["javascript", "html"])
+    }
+
+    /// Every distinct WebAssembly module, found by header or extension.
+    pub fn wasm_files(&self) -> Vec<&ArchiveFile> {
+        self.distinct_files(&["wasm"])
+    }
+
+    fn distinct_files(&self, kinds: &[&str]) -> Vec<&ArchiveFile> {
         let mut seen = std::collections::HashSet::new();
         self.files
             .iter()
-            .filter(|file| matches!(file_kind(&file.path, &file.bytes), "javascript" | "html"))
+            .filter(|file| kinds.contains(&file_kind(&file.path, &file.bytes)))
             .filter(|file| seen.insert((file.path.clone(), sha256_hex(&file.bytes))))
             .collect()
     }
@@ -445,6 +467,17 @@ pub fn extension(path: &str) -> String {
 }
 
 pub fn file_kind(path: &str, bytes: &[u8]) -> &'static str {
+    // AppleDouble (`__MACOSX/._x`), .DS_Store, and Thumbs.db (OLE) headers.
+    if bytes.starts_with(&[0x00, 0x05, 0x16, 0x07])
+        || bytes.starts_with(b"\x00\x00\x00\x01Bud1")
+        || (bytes.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+            && is_os_junk(path))
+    {
+        return "metadata";
+    }
+    if bytes.starts_with(crate::wasm::MAGIC) {
+        return "wasm";
+    }
     if bytes.starts_with(b"\x7fELF")
         || bytes.starts_with(b"dex\n")
         || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
@@ -581,9 +614,34 @@ mod tests {
     }
 
     #[test]
-    fn ignores_macos_metadata() {
-        let (archive, report) = read_zip(&[("__MACOSX/._main.js", b"x"), ("main.js", b"y")]);
-        assert!(report.findings.is_empty());
-        assert_eq!(archive.installed_files().count(), 1);
+    fn real_macos_metadata_is_quiet() {
+        let (archive, report) = read_zip(&[
+            (
+                "__MACOSX/._main.js",
+                b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X",
+            ),
+            ("sub/.DS_Store", b"\x00\x00\x00\x01Bud1\x00\x00"),
+            ("main.js", b"y"),
+        ]);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        // Acode installs these too, so they are part of the installed tree.
+        assert_eq!(archive.installed_files().count(), 3);
+        assert_eq!(archive.javascript_files().len(), 1);
+    }
+
+    #[test]
+    fn code_in_metadata_paths_is_scanned() {
+        let (archive, report) = read_zip(&[
+            ("__MACOSX/payload.js", b"eval(atob(p))"),
+            (".DS_Store", b"Executor.execute('id')"),
+            ("main.js", b"y"),
+        ]);
+        assert!(report.has("archive.metadata_path_content"));
+        let scripts: Vec<_> = archive
+            .javascript_files()
+            .into_iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert!(scripts.contains(&"__MACOSX/payload.js"), "{scripts:?}");
     }
 }

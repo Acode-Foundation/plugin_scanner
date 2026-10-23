@@ -9,6 +9,7 @@ mod report;
 mod rules;
 mod severity;
 mod terminal;
+mod wasm;
 
 use std::process::ExitCode;
 

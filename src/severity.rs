@@ -62,10 +62,11 @@ pub enum Category {
     Storage,
     AcodeApi,
     Obfuscation,
+    Wasm,
 }
 
 impl Category {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Archive,
         Self::Manifest,
         Self::Shell,
@@ -77,6 +78,7 @@ impl Category {
         Self::Storage,
         Self::AcodeApi,
         Self::Obfuscation,
+        Self::Wasm,
     ];
 
     pub fn key(self) -> &'static str {
@@ -92,6 +94,7 @@ impl Category {
             Self::Storage => "storage",
             Self::AcodeApi => "acode_api",
             Self::Obfuscation => "obfuscation",
+            Self::Wasm => "wasm",
         }
     }
 
@@ -108,6 +111,7 @@ impl Category {
             Self::Storage => "Browser storage",
             Self::AcodeApi => "Acode APIs and hooks",
             Self::Obfuscation => "Obfuscation",
+            Self::Wasm => "WebAssembly",
         }
     }
 
@@ -130,6 +134,7 @@ impl Category {
             Self::Storage => "uses localStorage, IndexedDB, or cookies",
             Self::AcodeApi => "uses Acode lifecycle, modules, commands, and editor state",
             Self::Obfuscation => "code is deliberately hard to read",
+            Self::Wasm => "ships or loads compiled WebAssembly that can't be read as source",
         }
     }
 }

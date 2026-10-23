@@ -27,7 +27,42 @@ pub struct DiffReport {
     pub new_required_modules: Vec<String>,
     pub new_defined_modules: Vec<String>,
     pub new_permissions: Vec<String>,
+    /// High-risk capabilities the old version already had, now used with
+    /// new arguments (another shell command, native action, or script URL).
+    pub new_arguments: Vec<ArgumentChange>,
     pub files: FileChanges,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArgumentChange {
+    pub key: String,
+    pub added: Vec<String>,
+}
+
+/// Rules whose evidence is the argument itself (a command, `Service.action`,
+/// or URL) rather than a code snippet, so it survives rebuilds and a change
+/// means the plugin does something new.
+const ARGUMENT_RULES: &[&str] = &[
+    "shell.exec",
+    "native.cordova_exec",
+    "dynamic.remote_script",
+    "wasm.remote_module",
+    "network.acode_account_write",
+];
+
+/// Every evidence string per stable key, across files.
+fn arguments_by_key(report: &Report) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for finding in report
+        .findings
+        .iter()
+        .filter(|finding| ARGUMENT_RULES.contains(&finding.id.as_str()))
+    {
+        let entry = map.entry(finding.key.as_str()).or_default();
+        entry.insert(finding.evidence.as_str());
+        entry.extend(finding.all_evidence.iter().map(String::as_str));
+    }
+    map
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +221,22 @@ pub fn diff(old: &Report, new: &Report) -> DiffReport {
             .collect(),
     };
 
+    let old_arguments = arguments_by_key(old);
+    let new_arguments: Vec<ArgumentChange> = arguments_by_key(new)
+        .into_iter()
+        .filter_map(|(key, arguments)| {
+            let before = old_arguments.get(key)?;
+            let added: Vec<String> = arguments
+                .difference(before)
+                .map(|argument| argument.to_string())
+                .collect();
+            (!added.is_empty()).then(|| ArgumentChange {
+                key: key.to_string(),
+                added,
+            })
+        })
+        .collect();
+
     let mut reasons = Vec::new();
     let (old_info, new_info) = (info(old), info(new));
     if old_info.id.is_some() && old_info.id != new_info.id {
@@ -216,6 +267,13 @@ pub fn diff(old: &Report, new: &Report) -> DiffReport {
             escalation.to.label(),
             escalation.message,
             escalation.key
+        ));
+    }
+    for change in &new_arguments {
+        reasons.push(format!(
+            "New arguments for an existing capability [{}]: {}",
+            change.key,
+            crate::rules::shorten(&change.added.join(", "), 160)
         ));
     }
     if !new_permissions.is_empty() {
@@ -254,6 +312,7 @@ pub fn diff(old: &Report, new: &Report) -> DiffReport {
         new_required_modules,
         new_defined_modules,
         new_permissions,
+        new_arguments,
         files,
     }
 }
@@ -318,6 +377,13 @@ pub fn render_text(diff: &DiffReport, markdown: bool) -> String {
                 escalation.to.label(),
                 escalation.message
             ));
+        }
+        out.push(String::new());
+    }
+    if !diff.new_arguments.is_empty() {
+        out.push(heading("New arguments to existing capabilities"));
+        for change in &diff.new_arguments {
+            out.push(format!("- `{}`: {}", change.key, change.added.join(", ")));
         }
         out.push(String::new());
     }
@@ -394,6 +460,36 @@ mod tests {
         );
         assert_eq!(diff.recommendation, Recommendation::Pass);
         assert!(diff.new_findings.is_empty());
+    }
+
+    fn shell(command: &str) -> Finding {
+        Finding::new(
+            "shell.exec",
+            Severity::High,
+            Category::Shell,
+            "Runs shell",
+            command,
+        )
+        .keyed("execute")
+    }
+
+    #[test]
+    fn new_command_under_same_key_needs_review() {
+        let old = report(vec![shell("apk add git")], Recommendation::Review);
+        let new = report(
+            vec![shell("apk add git"), shell("sh /sdcard/.cache/u.sh")],
+            Recommendation::Review,
+        );
+        let diff = diff(&old, &new);
+        assert_eq!(diff.recommendation, Recommendation::Review);
+        assert_eq!(diff.new_arguments.len(), 1);
+        assert_eq!(diff.new_arguments[0].added, vec!["sh /sdcard/.cache/u.sh"]);
+
+        // Same commands, moved between chunks, stay quiet.
+        let mut moved = shell("apk add git");
+        moved.file = Some("chunk.js".into());
+        let diff = super::diff(&old, &report(vec![moved], Recommendation::Review));
+        assert_eq!(diff.recommendation, Recommendation::Pass);
     }
 
     #[test]
