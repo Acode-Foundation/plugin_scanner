@@ -155,7 +155,49 @@ fn resolve_entry(
             key.to_string(),
         ));
     }
-    Some(sanitize_zip_path(key))
+
+    // loadPlugin.js doesn't reuse the installer's path: it joins the raw
+    // `main` onto the plugin folder, loads it if that file exists, and
+    // otherwise loads main.js.
+    let installed = sanitize_zip_path(key);
+    let loaded = loader_path(key);
+    if loaded == ".." || loaded.starts_with("../") {
+        report.push(manifest_finding(
+            "manifest.main_escapes_plugin_dir",
+            Severity::Critical,
+            "Acode's loader resolves `main` outside the plugin folder, so the script that runs is not the one in the zip",
+            format!("main = {key:?}: installed as {installed}, loader runs <plugins>/{}", loaded.trim_start_matches("../")),
+        ));
+        return Some(loaded);
+    }
+    if loaded != installed {
+        report.push(manifest_finding(
+            "manifest.main_loader_mismatch",
+            Severity::Medium,
+            "Acode installs `main` at one path but its loader looks for another, so it loads main.js instead",
+            format!("main = {key:?}: installed as {installed}, loader looks for {loaded}"),
+        ));
+        return Some("main.js".to_string());
+    }
+    Some(installed)
+}
+
+/// Path, relative to the plugin folder, that loadPlugin.js loads for `main`.
+/// `Url.join` normalises like Node's `path.join`: `.` and inner `..` collapse,
+/// but a `..` past the start survives and climbs out of the folder. Unlike in
+/// the installer, backslashes are ordinary characters.
+fn loader_path(main: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for part in main.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if stack.last().is_some_and(|last| *last != "..") => {
+                stack.pop();
+            }
+            part => stack.push(part),
+        }
+    }
+    stack.join("/")
 }
 
 fn validate_fields(object: &Map<String, Value>, manifest: &PluginManifest, report: &mut Report) {
@@ -376,6 +418,57 @@ mod tests {
             README,
         ]);
         assert!(report.has("manifest.main_fallback"));
+        assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
+    }
+
+    fn manifest_with_main(main: &str) -> Vec<u8> {
+        format!(r#"{{"id":"com.example.ok","name":"Ok","main":{main:?},"version":"1.0.0"}}"#)
+            .into_bytes()
+    }
+
+    #[test]
+    fn main_climbing_out_of_plugin_dir_is_critical() {
+        let json = manifest_with_main("../victim/main.js");
+        let (manifest, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("../victim/main.js", b"reviewed code"),
+            ICON,
+            README,
+        ]);
+        assert!(report.has("manifest.main_escapes_plugin_dir"));
+        // The installer wrote victim/main.js inside the plugin folder, but the
+        // loader runs <plugins>/victim/main.js.
+        assert_eq!(
+            manifest.unwrap().entry.as_deref(),
+            Some("../victim/main.js")
+        );
+    }
+
+    #[test]
+    fn backslash_main_makes_loader_fall_back() {
+        let json = manifest_with_main("dist\\main.js");
+        let (manifest, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("dist\\main.js", b"shown to reviewers"),
+            ("main.js", b"actually runs"),
+            ICON,
+            README,
+        ]);
+        assert!(report.has("manifest.main_loader_mismatch"));
+        assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
+    }
+
+    #[test]
+    fn inner_dot_segments_in_main_are_harmless() {
+        let json = manifest_with_main("dist/../main.js");
+        let (manifest, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("dist/../main.js", b""),
+            ICON,
+            README,
+        ]);
+        assert!(!report.has("manifest.main_escapes_plugin_dir"));
+        assert!(!report.has("manifest.main_loader_mismatch"));
         assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
     }
 

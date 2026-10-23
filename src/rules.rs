@@ -105,12 +105,16 @@ pub struct FileFacts {
     pub reads_sensitive_data: bool,
     pub listens_to_keys: bool,
     pub minified: bool,
+    /// WebAssembly modules inlined as base64 strings.
+    pub embedded_wasm: Vec<Vec<u8>>,
 }
 
 pub struct RuleContext<'a> {
     pub file: &'a str,
     pub source: &'a str,
     pub plugin_id: Option<&'a str>,
+    /// Installed path of the script Acode loads, when known.
+    pub entry: Option<&'a str>,
     line_starts: Vec<usize>,
     pub findings: Vec<Finding>,
     pub facts: FileFacts,
@@ -122,6 +126,7 @@ impl<'a> RuleContext<'a> {
             file,
             source,
             plugin_id,
+            entry: None,
             line_starts: line_starts(source),
             findings: Vec::new(),
             facts: FileFacts::default(),
@@ -205,6 +210,12 @@ pub struct Arg {
     pub is_function: bool,
     /// What the argument refers to, e.g. `acode` for `Object.assign(acode, …)`.
     pub path: Option<String>,
+    /// An object literal, e.g. fetch options.
+    pub is_object: bool,
+    /// URL of a `fetch(url)` call passed as this argument, when partly known.
+    pub fetch_url: Option<String>,
+    /// `method` of an options object literal, e.g. `fetch(url, { method: "POST" })`.
+    pub http_method: Option<String>,
 }
 
 impl Arg {
@@ -344,6 +355,7 @@ pub fn classify_call(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
                 call.arg_text(0).unwrap_or("fetch(…)"),
             );
             record_url(ctx, call.arg_text(0));
+            classify_acode_account(ctx, call);
         }
         "XMLHttpRequest" => ctx.add(
             "network.xhr",
@@ -381,6 +393,11 @@ pub fn classify_call(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
             call.arg_text(0).unwrap_or("sendBeacon"),
         ),
         "importScripts" => classify_import(ctx, call.span, call.arg(0)),
+        "WebAssembly.instantiate"
+        | "WebAssembly.instantiateStreaming"
+        | "WebAssembly.compile"
+        | "WebAssembly.compileStreaming"
+        | "WebAssembly.Module" => classify_wasm_load(ctx, call),
         "Worker" | "SharedWorker" => {
             let source = call.arg_text(0).unwrap_or("");
             if is_remote_url(source) {
@@ -595,6 +612,31 @@ fn classify_fallback(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
     );
 }
 
+fn classify_wasm_load(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
+    let method = call.path.trim_start_matches("WebAssembly.");
+    match call.arg(0).and_then(|arg| arg.fetch_url.as_deref()) {
+        Some(url) if is_remote_url(url) => {
+            ctx.add(
+                "wasm.remote_module",
+                Severity::High,
+                Category::Wasm,
+                Some(call.span),
+                "Compiles WebAssembly downloaded from a remote server, so the code was never reviewed",
+                url,
+            );
+            record_url(ctx, Some(url));
+        }
+        _ => ctx.add(
+            "wasm.instantiate",
+            Severity::Info,
+            Category::Wasm,
+            Some(call.span),
+            "Compiles or instantiates WebAssembly",
+            format!("WebAssembly.{method}"),
+        ),
+    }
+}
+
 fn classify_code_sink(ctx: &mut RuleContext<'_>, call: &Call<'_>, id: &str, name: &str) {
     // Function("a", "b", "return a+b"): the body is the last argument.
     let code = if call.path == "Function" {
@@ -692,11 +734,9 @@ fn classify_executor(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
     match method {
         "execute" | "start" | "spawnStream" | "write" => {
             // spawnStream takes an argv array; the resolver joins it.
-            let command = if method == "write" {
-                call.arg_text(1)
-            } else {
-                call.arg_text(0)
-            };
+            let index = if method == "write" { 1 } else { 0 };
+            let command = call.arg_text(index);
+            classify_command_source(ctx, call, call.arg(index), "Executor");
             ctx.push(
                 ctx.finding(
                     "shell.exec",
@@ -737,11 +777,55 @@ fn classify_executor(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
 }
 
 fn classify_terminal_module(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
-    if method == "write"
-        && let Some(data) = call.arg_text(1)
-    {
+    if method != "write" {
+        return;
+    }
+    classify_command_source(ctx, call, call.arg(1), "the terminal module");
+    if let Some(data) = call.arg_text(1) {
         classify_command(ctx, call.span, data);
     }
+}
+
+/// A command whose text came from the network or a decoder, graded like the
+/// same value reaching `eval`. Constant commands inside a fetch callback are
+/// not remote, so only commands with runtime parts count there.
+fn classify_command_source(
+    ctx: &mut RuleContext<'_>,
+    call: &Call<'_>,
+    command: Option<&Arg>,
+    via: &str,
+) {
+    let Some(command) = command else {
+        return;
+    };
+    let (id, severity, message) =
+        if command.remote || (call.in_remote_callback && command.value.is_none()) {
+            (
+                "shell.remote_command",
+                Severity::Critical,
+                format!("Runs a shell command downloaded at runtime through {via}"),
+            )
+        } else if command.decoded {
+            (
+                "shell.decoded_command",
+                Severity::High,
+                format!("Runs a decoded/encoded shell command through {via}"),
+            )
+        } else {
+            return;
+        };
+    let evidence = command
+        .text()
+        .map(str::to_string)
+        .unwrap_or_else(|| ctx.snippet(call.span));
+    ctx.add(
+        id,
+        severity,
+        Category::Shell,
+        Some(call.span),
+        message,
+        evidence,
+    );
 }
 
 fn classify_terminal_env(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
@@ -1109,6 +1193,9 @@ fn classify_fs_operation(ctx: &mut RuleContext<'_>, call: &Call<'_>, rest: &str)
         );
         return;
     }
+    if classify_self_modify(ctx, call, target, method) {
+        return;
+    }
     let (id, severity, message) = match method {
         "readFile" | "lsDir" => {
             ctx.facts.reads_sensitive_data = true;
@@ -1143,11 +1230,193 @@ fn classify_fs_operation(ctx: &mut RuleContext<'_>, call: &Call<'_>, rest: &str)
     );
 }
 
+/// Writing scripts where the plugin, or Acode, loads code from means the code
+/// that runs later was never part of a reviewed zip. Returns true when it
+/// reported something.
+fn classify_self_modify(
+    ctx: &mut RuleContext<'_>,
+    call: &Call<'_>,
+    target: &str,
+    method: &str,
+) -> bool {
+    let mut parts = target.split('|');
+    let zone = parts.next().unwrap_or("");
+    if !matches!(zone, "plugin_dir" | "own_dir" | "app_data") {
+        return false;
+    }
+    // createFile(name, data) and renameTo(name) carry the file name; writeFile
+    // writes to the path itself.
+    let (name_arg, data_arg) = match method {
+        "writeFile" => (None, call.arg(0)),
+        "createFile" => (call.arg_value(0), call.arg(1)),
+        "renameTo" => (call.arg_value(0), None),
+        _ => return false,
+    };
+    let Some(name) = parts.chain(name_arg).find(|name| is_loadable_name(name)) else {
+        return false;
+    };
+    let file = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    let entry = ctx
+        .entry
+        .map_or("main.js", |entry| entry.rsplit('/').next().unwrap_or(entry))
+        .to_ascii_lowercase();
+    let remote = data_arg
+        .is_some_and(|data| data.remote || (call.in_remote_callback && data.value.is_none()));
+    let loads_on_start = file == "plugin.json" || (zone != "app_data" && file == entry);
+    let (severity, message) = if remote {
+        (
+            Severity::Critical,
+            "Saves downloaded code as a script file, so what runs later was never reviewed",
+        )
+    } else if loads_on_start {
+        (
+            Severity::Critical,
+            "Rewrites its own entry script or plugin.json at runtime, replacing the reviewed code",
+        )
+    } else {
+        (
+            Severity::High,
+            "Writes script files where plugins load code from at runtime",
+        )
+    };
+    let confidence = if zone == "own_dir" {
+        // Found through a `baseUrl` name, not a constant Acode defines.
+        Confidence::Medium
+    } else {
+        Confidence::High
+    };
+    ctx.push(
+        ctx.finding(
+            "tampering.self_modify",
+            severity,
+            Category::Tampering,
+            Some(call.span),
+            message,
+            format!("fsOperation({zone}…{name}).{method}"),
+        )
+        .with_confidence(confidence)
+        .keyed(file),
+    );
+    true
+}
+
+/// File names Acode or a browser will run: scripts, pages, wasm, the manifest.
+fn is_loadable_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    file == "plugin.json"
+        || [".js", ".mjs", ".cjs", ".html", ".htm", ".wasm"]
+            .iter()
+            .any(|ext| file.ends_with(ext))
+}
+
+/// acode.app API paths that return the signed-in user's account data.
+const ACODE_ACCOUNT_READS: &[&str] =
+    &["/api/login", "/api/user", "/api/plugin/owned", "owned=true"];
+
+/// Acode's fetch polyfill adds `credentials: "include"` to every request whose
+/// URL contains `acode.app/api`, so a plugin's request is made as the
+/// signed-in user.
+fn classify_acode_account(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
+    let Some(url) = call.arg_text(0) else {
+        return;
+    };
+    let lower = url.to_ascii_lowercase();
+    if !lower.contains("acode.app/api") {
+        return;
+    }
+    let method = match call.arg(1) {
+        None => Some("GET".to_string()),
+        Some(options) => match &options.http_method {
+            Some(method) => Some(method.to_ascii_uppercase()),
+            // An options literal without `method` is still a GET; anything
+            // else could say anything.
+            None => options.is_object.then(|| "GET".to_string()),
+        },
+    };
+    let span = Some(call.span);
+    match method.as_deref() {
+        Some("GET" | "HEAD") => {
+            if ACODE_ACCOUNT_READS.iter().any(|path| lower.contains(path)) {
+                ctx.facts.reads_sensitive_data = true;
+                ctx.push(
+                    ctx.finding(
+                        "network.acode_account_read",
+                        Severity::Medium,
+                        Category::Network,
+                        span,
+                        "Reads the signed-in user's acode.app account (Acode sends their session cookies)",
+                        url,
+                    )
+                    .keyed(account_path(&lower)),
+                );
+            }
+        }
+        Some(method) => ctx.push(
+            ctx.finding(
+                "network.acode_account_write",
+                Severity::High,
+                Category::Network,
+                span,
+                "Changes data on acode.app as the signed-in user (Acode sends their session cookies)",
+                format!("{method} {url}"),
+            )
+            .keyed(format!("{method} {}", account_path(&lower))),
+        ),
+        None => ctx.push(
+            ctx.finding(
+                "network.acode_account_write",
+                Severity::Medium,
+                Category::Network,
+                span,
+                "Calls acode.app's API as the signed-in user with a method decided at runtime",
+                url,
+            )
+            .with_confidence(Confidence::Low)
+            .keyed(format!("? {}", account_path(&lower))),
+        ),
+    }
+}
+
+/// `https://acode.app/api/plugin/…?x=1` -> `/api/plugin`, stable across ids.
+fn account_path(url: &str) -> String {
+    let path = url
+        .split_once("acode.app")
+        .map_or(url, |(_, rest)| rest)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    path.split('/')
+        .take_while(|part| !part.contains('…'))
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn classify_cordova_exec(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
     let service = call.arg_value(2);
     let action = call.arg_value(3).unwrap_or("?");
     let span = Some(call.span);
     match service {
+        Some("Authenticator") => ctx.push(
+            ctx.finding(
+                "native.account_bridge",
+                if action == "saveToken" {
+                    Severity::Critical
+                } else {
+                    Severity::High
+                },
+                Category::Native,
+                span,
+                if action == "saveToken" {
+                    "Plants an acode.app session token through Acode's account bridge"
+                } else {
+                    "Calls Acode's acode.app account bridge directly (log in / log out)"
+                },
+                format!("Authenticator.{action}"),
+            )
+            .keyed(action),
+        ),
         Some("Tee") => ctx.push(
             ctx.finding(
                 "native.plugin_context_bridge",
@@ -1393,6 +1662,20 @@ pub fn classify_string(ctx: &mut RuleContext<'_>, value: &str, span: Span) {
     if value.len() >= 8 && value.contains("://") {
         ctx.facts.urls.extend(extract_urls(value));
     }
+    if let Some(module) = decode_wasm_payload(value) {
+        if ctx.facts.embedded_wasm.len() < MAX_EMBEDDED_WASM {
+            ctx.facts.embedded_wasm.push(module);
+        }
+        ctx.add(
+            "wasm.embedded_module",
+            Severity::Low,
+            Category::Wasm,
+            Some(span),
+            "WebAssembly module inlined as a base64 string (decoded and checked like a shipped one)",
+            format!("{} base64 characters", value.len()),
+        );
+        return;
+    }
     if value.len() >= BASE64_PAYLOAD_MIN_LEN
         && let Some(decoded) = decode_js_payload(value)
     {
@@ -1513,6 +1796,23 @@ fn looks_like_jsfuck(source: &str) -> bool {
         }
     }
     total > 0 && symbols * 100 >= total * 85
+}
+
+const MAX_EMBEDDED_WASM: usize = 16;
+
+/// `AGFzbQ…` or `data:application/wasm;base64,AGFzbQ…`.
+fn decode_wasm_payload(value: &str) -> Option<Vec<u8>> {
+    let data = match value.strip_prefix("data:") {
+        Some(rest) => rest.split_once(";base64,")?.1,
+        None => value,
+    };
+    if !data.starts_with(crate::wasm::BASE64_MAGIC) || data.len() < 16 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim_end())
+        .ok()?;
+    bytes.starts_with(crate::wasm::MAGIC).then_some(bytes)
 }
 
 fn decode_js_payload(value: &str) -> Option<String> {

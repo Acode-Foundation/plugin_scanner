@@ -7,7 +7,7 @@ use crate::severity::{Category, Confidence, Severity};
 /// Bumped whenever the JSON shape changes incompatibly.
 pub const SCHEMA_VERSION: u32 = 2;
 /// Bumped whenever rules or severities change, so stored reports can be rescanned.
-pub const RULES_VERSION: &str = "2026.10.1";
+pub const RULES_VERSION: &str = "2026.10.2";
 
 /// Upper bound on extra source locations kept per aggregated finding.
 const MAX_LOCATIONS: usize = 8;

@@ -41,7 +41,7 @@ threshold reached, `2` unreadable archive or other error.
 | --- | --- | --- |
 | `pass` | Nothing above Medium. Safe to publish without a human look. | Normal editor plugins: fs, fetch, commands, storage, settings. |
 | `review` | Something powerful enough that a person should look. | Shell/terminal access, all-files permission, Play billing, obfuscation, tampering with other plugins, decoded code execution, scan incomplete. |
-| `block` | A Critical finding: no legitimate plugin needs it, or the zip is built to confuse the installer. | Remote code execution, core-module hijack, download-and-run shell commands, plugin-context bridge calls, exfiltration to webhooks, install-path collisions, no `plugin.json`. |
+| `block` | A Critical finding: no legitimate plugin needs it, or the zip is built to confuse the installer. | Remote code or shell commands, core-module hijack, download-and-run shell commands, plugin-context bridge calls, planting an acode.app session, rewriting its own entry script, exfiltration to webhooks, install-path collisions, a `main` the loader resolves outside the plugin, no `plugin.json`. |
 
 For **updates**, use `diff`. A terminal plugin always comes out as `review`
 on a full scan, but if nothing new appears in the diff, the update is `pass`.
@@ -93,18 +93,29 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
   - encrypted entries
   - compression methods other than stored/deflate
   - native binaries detected by magic bytes
+  - code under `__MACOSX/`, `.DS_Store` or `Thumbs.db` names, which unzip
+    tools hide but Acode installs (real metadata is recognised by its header)
 
   Overwritten entries are still analysed.
-- **Entry resolution like `installPlugin.js`.** `main` is looked up by exact
-  key, so `"./dist/main.js"` falls back to `main.js`, just as on device.
+- **Entry resolution like `installPlugin.js` and `loadPlugin.js`.** `main` is
+  looked up by exact key, so `"./dist/main.js"` falls back to `main.js`, just
+  as on device. The loader then joins the raw `main` onto the plugin folder,
+  so a `main` that climbs out with `..` runs a file that was never in the zip,
+  and one with backslashes makes the loader fall back to `main.js`.
 - **Alias and constant-string resolution.** These all resolve:
   - `const w = window`, `const { exec } = cordova`
   - `acode.require("fs")` stored in a variable
   - `window["ev" + "al"]`, `atob("ZXZhbA==")`
   - `String.fromCharCode(...)`, `[...].join("")`, `"lave".split("").reverse().join("")`
-  - `(0, fn)(...)`
+  - `(0, fn)(...)`, `fn.call(t, ...)`, `fn.apply(t, [...])`, `fn.bind(t)(...)`,
+    `Reflect.apply(fn, t, [...])`
 - **One-hop taint.** Values built from `fetch` / `XMLHttpRequest` responses or
-  decoders are tracked through variables and `.then(...)` chains.
+  decoders are tracked through variables and `.then(...)` chains, into `eval`,
+  shell commands, and files written where code is loaded from.
+- **WebAssembly is opened up.** Shipped modules (found by header, whatever
+  their extension) and base64 modules inlined in JS are parsed: imports that
+  run JavaScript strings are flagged, and URLs in data segments go through the
+  same endpoint and exfiltration checks as JS.
 - **Zip-bomb safe.** Reads are capped by the limits, not by declared sizes.
   Hitting a limit marks the scan incomplete, which forces `review`.
 
@@ -112,16 +123,17 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
 
 | Area | Rule IDs (severity) |
 | --- | --- |
-| Archive | `install_path_collision` (C), `path_traversal`, `duplicate_entry`, `encrypted_entry`, `unsupported_compression`, `oversized_entry`, `total_size_limit`, `too_many_entries`, `native_binary` (H), `absolute_path`, `nested_archive` (M) |
-| Manifest | `missing`, `invalid_json`, `no_entrypoint` (C), `missing_id/name/version` (H), `invalid_id`, `invalid_version`, `invalid_price`, `invalid_min_version_code`, `missing_icon`, `missing_readme`, `non_js_entry` (M), `dependencies`, `icon_too_large` (L), `main_fallback` (I) |
-| Shell | `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, shell-profile persistence), `load_library` (C), `exec`, `terminal_module` (H), `terminal_environment`, `process_control` (M/H) |
-| Native | `plugin_context_bridge` (`cordova.exec` to `Tee`), `cordova_exec_dynamic` (C), `cordova_exec`, `manage_all_files`, `in_app_purchase` (H), `permission_request`, `launch_app`, `intent_access`, `purchase_read`, `cordova_require`, `cordova_plugin` (M), `file_intent`, `device_setting`, `os_integration` (L) |
-| Tampering | `core_module_override` (`acode.define("fs")` etc.) (C), `acode_api`, `cordova_bridge`, `network_hook`, `other_plugin`, `plugin_files` (writes into another plugin's folder), `rewards` (H), `editor_manager`, `define_dynamic`, `unmount_dynamic` (M) |
+| Archive | `install_path_collision` (C), `path_traversal`, `duplicate_entry`, `encrypted_entry`, `unsupported_compression`, `oversized_entry`, `total_size_limit`, `too_many_entries`, `native_binary` (H), `absolute_path`, `nested_archive`, `metadata_path_content` (M) |
+| Manifest | `missing`, `invalid_json`, `no_entrypoint`, `main_escapes_plugin_dir` (C), `missing_id/name/version` (H), `invalid_id`, `invalid_version`, `invalid_price`, `invalid_min_version_code`, `missing_icon`, `missing_readme`, `non_js_entry`, `main_loader_mismatch` (M), `dependencies`, `icon_too_large` (L), `main_fallback` (I) |
+| Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, shell-profile persistence), `load_library` (C), `exec`, `terminal_module` (H), `terminal_environment`, `process_control` (M/H) |
+| Native | `plugin_context_bridge` (`cordova.exec` to `Tee`), `cordova_exec_dynamic` (C), `account_bridge` (`Authenticator`; C for `saveToken`, else H), `cordova_exec`, `manage_all_files`, `in_app_purchase` (H), `permission_request`, `launch_app`, `intent_access`, `purchase_read`, `cordova_require`, `cordova_plugin` (M), `file_intent`, `device_setting`, `os_integration` (L) |
+| Tampering | `core_module_override` (`acode.define("fs")` etc.) (C), `self_modify` (writes scripts or `plugin.json` where code is loaded from; C when the content is downloaded or it rewrites the entry/manifest, else H), `acode_api`, `cordova_bridge`, `network_hook`, `other_plugin`, `plugin_files` (writes into another plugin's folder), `rewards` (H), `editor_manager`, `define_dynamic`, `unmount_dynamic` (M) |
 | Dynamic code | `remote_code`, `remote_import` (C), `remote_script`, `remote_worker`, `decoded_exec`, `indirect_function_constructor` (H), `eval`, `function_constructor`, `inline_script`, `script_blob`, `html_script` (M), `string_timer`, `script_element`, `import_expression` (L) |
-| Network | `suspicious_endpoint` (H/M/L by host type), `remote_command` (H), `native_http`, `remote_storage`, `local_server`, `beacon` (M), `fetch`, `xhr`, `websocket`, `event_source`, `open_browser` (L) |
+| Network | `suspicious_endpoint` (H/M/L by host type), `remote_command`, `acode_account_write` (H: non-GET to `acode.app/api`, which Acode sends with the user's cookies), `acode_account_read` (M), `native_http`, `remote_storage`, `local_server`, `beacon` (M), `fetch`, `xhr`, `websocket`, `event_source`, `open_browser` (L) |
 | Filesystem / storage | `delete`, `sdcard_write`, `system_write`, `system_exec_bits`, `storage_access_request`, `cordova_file` (M), `write`, `sdcard_read`, `system_read`, `cookies`, `clipboard_read` (L), `read`, `module`, `plugin_dir`, `web_storage`, `indexeddb` (I) |
 | Obfuscation | `obfuscator_tool`, `packer`, `jsfuck`, `encoded_js_payload` (H), `js.parse_failed`, `js.too_large`, `js.invalid_utf8` (M), `escaped_strings`, `hex_array` (L) |
-| Correlation | `exfiltration` (C): reads user data (files, editor text, storage, clipboard, keys) and talks to a data-capture endpoint |
+| WebAssembly | `remote_module` (H), `eval_import` (H, under dynamic code), `disguised`, `bad_magic`, `parse_failed` (M), `module`, `embedded_module` (L), `instantiate` (I) |
+| Correlation | `exfiltration` (C): reads user data (files, editor text, storage, clipboard, keys, acode.app account) and talks to a data-capture endpoint |
 
 Prefixes are omitted in the table; full IDs look like `shell.exec`.
 
@@ -131,7 +143,7 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 {
   "schema_version": 2,
   "scanner_version": "0.2.0",
-  "rules_version": "2026.10.1",        // rescan stored plugins when this changes
+  "rules_version": "2026.10.2",        // rescan stored plugins when this changes
   "plugin": { "id", "name", "version", "main", "entry", "permissions", "dependencies", ... },
   "verdict": { "risk": "high", "recommendation": "review", "complete": true, "reasons": ["..."] },
   "summary": { "total_findings", "by_severity", "by_category" },

