@@ -146,7 +146,7 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 ```jsonc
 {
   "schema_version": 2,
-  "scanner_version": "0.2.0",
+  "scanner_version": "0.3.0",
   "rules_version": "2026.10.3",        // rescan stored plugins when this changes
   "plugin": { "id", "name", "version", "main", "entry", "permissions", "dependencies", ... },
   "verdict": { "risk": "high", "recommendation": "review", "complete": true, "reasons": ["..."] },
