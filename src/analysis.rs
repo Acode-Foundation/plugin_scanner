@@ -148,6 +148,19 @@ pub fn scan_archive(archive: &PluginArchive, options: ScanOptions, report: &mut 
     }
 
     if !options.entry_only {
+        for file in archive.installed_files() {
+            if file_is_script(file) {
+                let source = String::from_utf8_lossy(&file.bytes);
+                let mut ctx = RuleContext::new(&file.path, &source, plugin_id.as_deref());
+                rules::scan_shell_script(&mut ctx);
+                url_sources.extend(
+                    std::mem::take(&mut ctx.facts.urls)
+                        .into_iter()
+                        .map(|url| (file.path.clone(), url)),
+                );
+                report.findings.extend(ctx.findings);
+            }
+        }
         for file in archive.wasm_files() {
             wasm::analyze(&file.path, &file.bytes, false, report, &mut url_sources);
         }
@@ -164,6 +177,13 @@ pub fn scan_archive(archive: &PluginArchive, options: ScanOptions, report: &mut 
     report.capabilities = capabilities(report);
     decide(report);
     report.refresh_summary();
+}
+
+fn file_is_script(file: &archive::ArchiveFile) -> bool {
+    matches!(
+        archive::file_kind(&file.path, &file.bytes),
+        "text" | "other"
+    ) && rules::is_shell_script(&file.path, &file.bytes)
 }
 
 fn analyse_endpoints(report: &mut Report, urls: &[(String, String)]) {

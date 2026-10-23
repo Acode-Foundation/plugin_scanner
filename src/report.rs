@@ -7,12 +7,14 @@ use crate::severity::{Category, Confidence, Severity};
 /// Bumped whenever the JSON shape changes incompatibly.
 pub const SCHEMA_VERSION: u32 = 2;
 /// Bumped whenever rules or severities change, so stored reports can be rescanned.
-pub const RULES_VERSION: &str = "2026.10.2";
+pub const RULES_VERSION: &str = "2026.10.3";
 
 /// Upper bound on extra source locations kept per aggregated finding.
 const MAX_LOCATIONS: usize = 8;
 /// Upper bound on distinct evidence samples kept per aggregated finding.
 const MAX_EXAMPLES: usize = 6;
+/// Upper bound on distinct evidence strings remembered for `diff`.
+const MAX_EVIDENCE_SET: usize = 256;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
@@ -124,6 +126,10 @@ pub struct Finding {
     pub examples: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<SourceSpan>,
+    /// Every distinct evidence string merged into this finding (bounded), so
+    /// `diff` can see new arguments beyond the few `examples` kept.
+    #[serde(skip)]
+    pub all_evidence: BTreeSet<String>,
 }
 
 impl Finding {
@@ -148,6 +154,7 @@ impl Finding {
             occurrences: 1,
             examples: Vec::new(),
             locations: Vec::new(),
+            all_evidence: BTreeSet::new(),
         }
     }
 
@@ -249,6 +256,9 @@ impl Report {
             );
             match groups.get_mut(&group_key) {
                 Some(existing) => {
+                    if existing.all_evidence.len() < MAX_EVIDENCE_SET {
+                        existing.all_evidence.insert(finding.evidence.clone());
+                    }
                     existing.occurrences += finding.occurrences;
                     existing.severity = existing.severity.max(finding.severity);
                     existing.confidence = existing.confidence.max(finding.confidence);
@@ -266,6 +276,8 @@ impl Report {
                     }
                 }
                 None => {
+                    let mut finding = finding;
+                    finding.all_evidence.insert(finding.evidence.clone());
                     order.push(group_key.clone());
                     groups.insert(group_key, finding);
                 }

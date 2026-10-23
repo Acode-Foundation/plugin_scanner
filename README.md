@@ -46,7 +46,10 @@ threshold reached, `2` unreadable archive or other error.
 For **updates**, use `diff`. A terminal plugin always comes out as `review`
 on a full scan, but if nothing new appears in the diff, the update is `pass`.
 Updates that add a High/Critical capability, a new declared permission, or a
-new flagged host are `review` (or `block`).
+new flagged host are `review` (or `block`). So are updates that keep a
+capability but use it with new arguments: a terminal plugin that starts
+running a different shell command, a new native `Service.action`, or a new
+remote script URL.
 
 Severity guide:
 
@@ -124,11 +127,12 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
 | Area | Rule IDs (severity) |
 | --- | --- |
 | Archive | `install_path_collision` (C), `path_traversal`, `duplicate_entry`, `encrypted_entry`, `unsupported_compression`, `oversized_entry`, `total_size_limit`, `too_many_entries`, `native_binary` (H), `absolute_path`, `nested_archive`, `metadata_path_content` (M) |
-| Manifest | `missing`, `invalid_json`, `no_entrypoint`, `main_escapes_plugin_dir` (C), `missing_id/name/version` (H), `invalid_id`, `invalid_version`, `invalid_price`, `invalid_min_version_code`, `missing_icon`, `missing_readme`, `non_js_entry`, `main_loader_mismatch` (M), `dependencies`, `icon_too_large` (L), `main_fallback` (I) |
-| Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, shell-profile persistence), `load_library` (C), `exec`, `terminal_module` (H), `terminal_environment`, `process_control` (M/H) |
+| Manifest | `missing`, `invalid_json`, `no_entrypoint`, `main_escapes_plugin_dir` (C), `missing_id/name/version`, `readme_password_form` (readme or changelog renders a password form; DOMPurify keeps forms) (H), `invalid_id`, `invalid_version`, `invalid_price`, `invalid_min_version_code`, `missing_icon`, `missing_readme`, `non_js_entry`, `main_loader_mismatch`, `readme_form` (M), `dependencies`, `icon_too_large` (L), `main_fallback` (I) |
+| Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, download-then-chmod, SSH keys / stored credentials, curl file uploads, piping env or files to the network, untrusted package sources, cron/boot persistence, shell-profile persistence), `load_library` (C), `exec`, `terminal_module` (H), `terminal_environment`, `process_control` (M/H), `script_file` (L; shipped `.sh` / `#!` scripts get the same command checks) |
 | Native | `plugin_context_bridge` (`cordova.exec` to `Tee`), `cordova_exec_dynamic` (C), `account_bridge` (`Authenticator`; C for `saveToken`, else H), `cordova_exec`, `manage_all_files`, `in_app_purchase` (H), `permission_request`, `launch_app`, `intent_access`, `purchase_read`, `cordova_require`, `cordova_plugin` (M), `file_intent`, `device_setting`, `os_integration` (L) |
-| Tampering | `core_module_override` (`acode.define("fs")` etc.) (C), `self_modify` (writes scripts or `plugin.json` where code is loaded from; C when the content is downloaded or it rewrites the entry/manifest, else H), `acode_api`, `cordova_bridge`, `network_hook`, `other_plugin`, `plugin_files` (writes into another plugin's folder), `rewards` (H), `editor_manager`, `define_dynamic`, `unmount_dynamic` (M) |
-| Dynamic code | `remote_code`, `remote_import` (C), `remote_script`, `remote_worker`, `decoded_exec`, `indirect_function_constructor` (H), `eval`, `function_constructor`, `inline_script`, `script_blob`, `html_script` (M), `string_timer`, `script_element`, `import_expression` (L) |
+| Tampering | `core_module_override` (`acode.define("fs")` etc.) (C), `self_modify` (writes scripts or `plugin.json` where code is loaded from; C when the content is downloaded or it rewrites the entry/manifest, else H), `acode_api`, `cordova_bridge`, `network_hook`, `native_api` (hooks `system`, `Executor`, `sdcard`…), `dom_hook` (wraps `addEventListener`, `appendChild`, input `value`…), `ads`, `plugin_settings` (edits `pluginsDisabled`), `other_plugin`, `plugin_files` (writes into another plugin's folder), `rewards` (H), `editor_manager`, `define_dynamic`, `unmount_dynamic` (M) |
+| Dynamic code | `remote_code`, `remote_import` (C), `remote_script`, `remote_worker`, `decoded_exec`, `indirect_function_constructor` (H), `eval`, `function_constructor`, `inline_script`, `script_blob`, `html_script`, `remote_html`, `decoded_html` (M: `innerHTML`, `insertAdjacentHTML`, `createContextualFragment`, `srcdoc`, `on*` attributes), `string_timer`, `script_element`, `import_expression`, `inline_handler` (L) |
+| Acode API | `webview_remote_page` (M), `webview`, `webview_script`, `intent_module`, `intent_handler`, `require_dynamic` (L), `install_plugin` (M), `editor_hook`, `require_module`, `define_module`, `global_key_listener` (I) |
 | Network | `suspicious_endpoint` (H/M/L by host type), `remote_command`, `acode_account_write` (H: non-GET to `acode.app/api`, which Acode sends with the user's cookies), `acode_account_read` (M), `native_http`, `remote_storage`, `local_server`, `beacon` (M), `fetch`, `xhr`, `websocket`, `event_source`, `open_browser` (L) |
 | Filesystem / storage | `delete`, `sdcard_write`, `system_write`, `system_exec_bits`, `storage_access_request`, `cordova_file` (M), `write`, `sdcard_read`, `system_read`, `cookies`, `clipboard_read` (L), `read`, `module`, `plugin_dir`, `web_storage`, `indexeddb` (I) |
 | Obfuscation | `obfuscator_tool`, `packer`, `jsfuck`, `encoded_js_payload` (H), `js.parse_failed`, `js.too_large`, `js.invalid_utf8` (M), `escaped_strings`, `hex_array` (L) |
@@ -143,7 +147,7 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 {
   "schema_version": 2,
   "scanner_version": "0.2.0",
-  "rules_version": "2026.10.2",        // rescan stored plugins when this changes
+  "rules_version": "2026.10.3",        // rescan stored plugins when this changes
   "plugin": { "id", "name", "version", "main", "entry", "permissions", "dependencies", ... },
   "verdict": { "risk": "high", "recommendation": "review", "complete": true, "reasons": ["..."] },
   "summary": { "total_findings", "by_severity", "by_category" },
@@ -163,7 +167,8 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 
 `diff --format json` returns `recommendation`, `reasons`, `new_findings`,
 `escalated`, `removed_findings`, `new_endpoints`, `new_required_modules`,
-`new_defined_modules`, `new_permissions`, and `files` (added/removed/changed).
+`new_defined_modules`, `new_permissions`, `new_arguments` (key and the
+arguments it didn't have before), and `files` (added/removed/changed).
 
 ## Using it on acode.app
 

