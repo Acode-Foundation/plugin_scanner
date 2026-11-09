@@ -68,6 +68,19 @@ pub enum Command {
         #[command(flatten)]
         limits: LimitArgs,
     },
+    /// Update this binary to the latest GitHub release, in place.
+    #[command(alias = "self-update")]
+    Update {
+        /// Only check whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+        /// Install this release (e.g. 0.3.0 or v0.3.0) instead of the latest.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// Reinstall even if this version is already installed.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Args)]

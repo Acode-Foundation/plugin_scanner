@@ -22,12 +22,16 @@ plugin_scanner scan plugin.zip --json --fail-on review
 
 # Compare the published version with an uploaded update
 plugin_scanner diff published.zip update.zip --format json --fail-on review
+
+# Update an installed binary in place to the latest release
+plugin_scanner update
 ```
 
 | Command / flag | What it does |
 | --- | --- |
 | `scan <zip>` | Full scan. Formats: `--format terminal` (default), `json`, `md` (reviewer report), `summary` (short user-facing disclosure). Shorthands: `--json`, `--markdown`, `--summary`. |
 | `diff <old> <new>` | What changed between two versions: new or escalated findings, new hosts, modules, permissions, changed files. `--format terminal\|json\|md`. |
+| `update` | Replace the running binary with the latest GitHub release (Linux x86_64/arm64, macOS arm64). `--check` only reports, `--version 0.3.0` installs a specific release (also downgrades), `--force` reinstalls. Needs `curl` or `wget`. The download is checked against the published `.sha256` and GitHub's digest, and run once before it replaces anything; use `sudo` if the binary is in a system folder. |
 | `--fail-on <level>` | Exit 1 when reached. For `scan`: `info`…`critical` (highest severity) or `review` / `block` (recommendation). For `diff`: `review` / `block`. |
 | `--entry-only` | Only analyse the script Acode loads. By default every JS/HTML file is analysed, because the entry script can load the rest at runtime. |
 | `--max-entry-bytes`, `--max-total-bytes`, `--max-entries` | Zip-bomb limits (defaults: 32 MiB per entry, 256 MiB total, 5000 entries). |
