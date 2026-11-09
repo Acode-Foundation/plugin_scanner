@@ -18,8 +18,11 @@ sha2 = "0.10"
 thiserror = "2.0.17"
 # Acode installs plugins with JSZip, which only understands stored and deflated
 # entries. Matching that keeps the scanner from reading content the installer
-# can't, and avoids pulling native compression libraries into the server build.
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+# can't, and avoids pulling native compression libraries into the server build
+# (zlib-rs is pure Rust). Pinned exactly because the archive reader uses
+# `zip::unstable::read::ZipIterable`, the only reader that keeps duplicate
+# entry names the way JSZip does.
+zip = { version = "=9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 regex = "1"
 base64 = "0.22"
 
