@@ -39,16 +39,17 @@ threshold reached, `2` unreadable archive or other error.
 
 | Recommendation | Meaning | Typical cause |
 | --- | --- | --- |
-| `pass` | Nothing above Medium. Safe to publish without a human look. | Normal editor plugins: fs, fetch, commands, storage, settings. |
-| `review` | Something powerful enough that a person should look. | Shell/terminal access, all-files permission, Play billing, obfuscation, tampering with other plugins, decoded code execution, scan incomplete. |
+| `pass` | Nothing above Medium. Safe to publish without a human look. | Normal editor plugins: fs, fetch, commands, storage, settings. Terminal plugins whose shell commands are all visible (`apk add`, `npm install`, `uname -m`). |
+| `review` | Something powerful enough that a person should look. | Shell commands the scanner cannot see (built at runtime, `sh -c $x`, piped into a shell), all-files permission, Play billing, obfuscation, tampering with other plugins, decoded code execution, scan incomplete. |
 | `block` | A Critical finding: no legitimate plugin needs it, or the zip is built to confuse the installer. | Remote code or shell commands, core-module hijack, download-and-run shell commands, plugin-context bridge calls, planting an acode.app session, rewriting its own entry script, exfiltration to webhooks, install-path collisions, a `main` the loader resolves outside the plugin, no `plugin.json`. |
 
-For **updates**, use `diff`. A terminal plugin always comes out as `review`
-on a full scan, but if nothing new appears in the diff, the update is `pass`.
-Updates that add a High/Critical capability, a new declared permission, or a
-new flagged host are `review` (or `block`). So are updates that keep a
-capability but use it with new arguments: a terminal plugin that starts
-running a different shell command, a new native `Service.action`, or a new
+For **updates**, use `diff`. If nothing new appears in the diff, the update is
+`pass`, even for a plugin that needed a review on its full scan. Updates that
+add a High/Critical capability, a new declared permission, or a new flagged
+host are `review` (or `block`). So are updates that keep a capability but use
+it with new arguments: a terminal plugin that starts running a different
+shell command (any command with side effects, even a Medium one; new
+read-only commands don't count), a new native `Service.action`, or a new
 remote script URL.
 
 Severity guide:
@@ -76,6 +77,35 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
   `fromCharCode`...) and Critical when it comes from a network response.
   Bundler idioms (`Function("return this")`, `<script>` chunk loaders with
   relative URLs) are ignored.
+- **Shell commands are graded by what they run.** Each command is split like
+  a shell would (`;`, `&&`, `||`, pipes, subshells, `$(…)`), and each part is
+  graded:
+  - **Low**: only read-only commands (`uname -m`, `command -v x`, `cat`,
+    `ls`, `test -f`, `tool --version`, `npm root -g`).
+  - **Medium**: visible commands with side effects (installing packages,
+    moving files, starting a local server, running a proot container), and
+    any command with a value the scanner can't work out (`cat "${path}"`).
+  - **High**: the scanner can't see what runs: the command name is built at
+    runtime or is an unset `$VAR`, `sh -c` / `eval` / `node -e` get a runtime
+    string, or text is piped into a shell or interpreter.
+  - Known-bad patterns (download-and-run, reverse shells, wiping
+    storage...) are still matched on top of this. They only match the
+    dangerous form: `rm -rf ~/` is Critical, `rm -rf ~/.cache/x` is not;
+    reading `/etc/profile` is not persistence; Acode's own
+    `/data/data/com.foxdebug.acode…` folder is not another app's.
+- **Shell helpers are followed.** In `const sh = c => Executor.execute(c)`,
+  each `sh("…")` call is graded with its own command. When every use of the
+  helper is a direct call, the helper's body adds no finding of its own. The
+  scanner also follows `this.run(cmd)` methods, getters such as
+  `getExecutor()`, quoting helpers (`'${s.replace(/'/g, …)}'`,
+  `JSON.stringify`), functions that build a script from a template, `$VAR`
+  names assigned earlier in the same script, and every branch of
+  `a ? "x" : "y"`.
+- **Process input is not a command.** Text written with `Executor.write` to a
+  program the plugin started (a language server, a kernel driver) is input
+  (Low). It is graded as a command only when the started process is a shell
+  or can't be seen. Unknown text typed into a terminal tab is Medium (it is
+  usually log output); a runtime command followed by Enter is High.
 - **Aggregation.** One finding per rule, stable key, and file, with an
   occurrence count and up to 8 locations.
 - **Endpoints are inventory.** URLs go into an `endpoints` list. Only known
@@ -128,7 +158,7 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
 | --- | --- |
 | Archive | `install_path_collision` (C), `path_traversal`, `duplicate_entry`, `encrypted_entry`, `unsupported_compression`, `oversized_entry`, `total_size_limit`, `too_many_entries`, `native_binary` (H), `absolute_path`, `nested_archive`, `metadata_path_content` (M) |
 | Manifest | `missing`, `invalid_json`, `no_entrypoint`, `main_escapes_plugin_dir` (C), `missing_id/name/version`, `readme_password_form` (readme or changelog renders a password form; DOMPurify keeps forms) (H), `invalid_id`, `invalid_version`, `invalid_price`, `invalid_min_version_code`, `missing_icon`, `missing_readme`, `non_js_entry`, `main_loader_mismatch`, `readme_form` (M), `dependencies`, `icon_too_large` (L), `main_fallback` (I) |
-| Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, download-then-chmod, SSH keys / stored credentials, curl file uploads, piping env or files to the network, untrusted package sources, cron/boot persistence, shell-profile persistence), `load_library` (C), `exec`, `terminal_module` (H), `terminal_environment`, `process_control` (M/H), `script_file` (L; shipped `.sh` / `#!` scripts get the same command checks) |
+| Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, download-then-chmod, SSH keys / stored credentials, curl file uploads, piping env or files to the network, untrusted package sources, cron/boot persistence, shell-profile persistence), `load_library` (C), `exec` (H/M/L by what the command runs; keys end in `:program`, `:inspect`, or `write:input`), `terminal_module`, `terminal_environment`, `process_control` (M/H), `script_file` (L; shipped `.sh` / `#!` scripts get the same command checks) |
 | Native | `plugin_context_bridge` (`cordova.exec` to `Tee`), `cordova_exec_dynamic` (C), `account_bridge` (`Authenticator`; C for `saveToken`, else H), `cordova_exec`, `manage_all_files`, `in_app_purchase` (H), `permission_request`, `launch_app`, `intent_access`, `purchase_read`, `cordova_require`, `cordova_plugin` (M), `file_intent`, `device_setting`, `os_integration` (L) |
 | Tampering | `core_module_override` (`acode.define("fs")` etc.) (C), `self_modify` (writes scripts or `plugin.json` where code is loaded from; C when the content is downloaded or it rewrites the entry/manifest, else H), `acode_api`, `cordova_bridge`, `network_hook`, `native_api` (hooks `system`, `Executor`, `sdcard`…), `dom_hook` (wraps `addEventListener`, `appendChild`, input `value`…), `ads`, `plugin_settings` (edits `pluginsDisabled`), `other_plugin`, `plugin_files` (writes into another plugin's folder), `rewards` (H), `editor_manager`, `define_dynamic`, `unmount_dynamic` (M) |
 | Dynamic code | `remote_code`, `remote_import` (C), `remote_script`, `remote_worker`, `decoded_exec`, `indirect_function_constructor` (H), `eval`, `function_constructor`, `inline_script`, `script_blob`, `html_script`, `remote_html`, `decoded_html` (M: `innerHTML`, `insertAdjacentHTML`, `createContextualFragment`, `srcdoc`, `on*` attributes), `string_timer`, `script_element`, `import_expression`, `inline_handler` (L) |
@@ -147,7 +177,7 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 {
   "schema_version": 2,
   "scanner_version": "0.3.0",
-  "rules_version": "2026.10.3",        // rescan stored plugins when this changes
+  "rules_version": "2026.11.1",        // rescan stored plugins when this changes
   "plugin": { "id", "name", "version", "main", "entry", "permissions", "dependencies", ... },
   "verdict": { "risk": "high", "recommendation": "review", "complete": true, "reasons": ["..."] },
   "summary": { "total_findings", "by_severity", "by_category" },

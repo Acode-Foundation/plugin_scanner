@@ -8,6 +8,7 @@ mod markdown;
 mod report;
 mod rules;
 mod severity;
+mod shell;
 mod terminal;
 mod wasm;
 

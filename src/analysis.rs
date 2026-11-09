@@ -459,17 +459,30 @@ mod tests {
     }
 
     #[test]
-    fn terminal_plugin_needs_review_but_not_block() {
-        let report = scan(&[
-            MANIFEST,
-            ICON,
-            README,
-            (
-                "main.js",
-                b"Executor.execute('apk add python3'); acode.require('terminal');",
-            ),
-        ]);
-        assert_eq!(report.verdict.recommendation, Recommendation::Review);
+    fn terminal_plugin_is_graded_by_its_commands() {
+        let verdict = |source: &[u8]| {
+            scan(&[MANIFEST, ICON, README, ("main.js", source)])
+                .verdict
+                .recommendation
+        };
+        // Visible commands: disclosed, but no review needed.
+        assert_eq!(
+            verdict(b"Executor.execute('apk add python3'); acode.require('terminal');"),
+            Recommendation::Pass
+        );
+        assert_eq!(
+            verdict(b"(() => { const sh = c => Executor.execute(c); sh('uname -m'); sh('npm i -g x'); })()"),
+            Recommendation::Pass
+        );
+        // A command the scanner cannot see needs a person, but is not blocked.
+        assert_eq!(
+            verdict(b"Executor.execute(localStorage.getItem('cmd'))"),
+            Recommendation::Review
+        );
+        assert_eq!(
+            verdict(b"Executor.execute(`sh -c ${JSON.stringify(input.value)}`)"),
+            Recommendation::Review
+        );
     }
 
     #[test]
