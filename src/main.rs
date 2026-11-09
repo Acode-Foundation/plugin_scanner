@@ -8,7 +8,9 @@ mod markdown;
 mod report;
 mod rules;
 mod severity;
+mod shell;
 mod terminal;
+mod update;
 mod wasm;
 
 use std::process::ExitCode;
@@ -90,6 +92,18 @@ fn run(cli: Cli) -> Result<u8, String> {
             println!("{output}");
             let failed = fail_on.is_some_and(|level| level.triggered(diff.recommendation));
             Ok(if failed { EXIT_THRESHOLD } else { EXIT_OK })
+        }
+        Command::Update {
+            check,
+            version,
+            force,
+        } => {
+            update::run(update::Options {
+                check,
+                version,
+                force,
+            })?;
+            Ok(EXIT_OK)
         }
     }
 }

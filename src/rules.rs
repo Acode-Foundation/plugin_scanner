@@ -19,6 +19,7 @@ use regex::Regex;
 use crate::{
     report::{Finding, SourceSpan},
     severity::{Category, Confidence, Severity},
+    shell::{self, Assessment, Tier},
 };
 
 /// Modules Acode registers in `lib/acode.js`. `acode.define` with one of these
@@ -107,6 +108,19 @@ pub struct FileFacts {
     pub minified: bool,
     /// WebAssembly modules inlined as base64 strings.
     pub embedded_wasm: Vec<Vec<u8>>,
+    /// One entry per `Executor.start`: whether the started process takes
+    /// shell commands on stdin (a shell, or a command the scanner can't see).
+    pub process_starts: Vec<bool>,
+    /// `Executor.write` calls, graded once every `start` in the file is known.
+    pub process_writes: Vec<PendingWrite>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingWrite {
+    pub span: Span,
+    pub text: Option<String>,
+    pub variants: Vec<String>,
+    pub via_helper: bool,
 }
 
 pub struct RuleContext<'a> {
@@ -216,6 +230,9 @@ pub struct Arg {
     pub object_keys: Vec<String>,
     /// URL of a `fetch(url)` call passed as this argument, when partly known.
     pub fetch_url: Option<String>,
+    /// Every value the argument can take when it branches
+    /// (`a ? "ls" : "rm -rf /"`), so each one is checked. Empty otherwise.
+    pub variants: Vec<String>,
     /// `method` of an options object literal, e.g. `fetch(url, { method: "POST" })`.
     pub http_method: Option<String>,
 }
@@ -223,6 +240,15 @@ pub struct Arg {
 impl Arg {
     pub fn text(&self) -> Option<&str> {
         self.value.as_deref().or(self.approx.as_deref())
+    }
+
+    /// The texts to check as commands: each branch, or the one text.
+    fn command_texts(&self) -> Vec<&str> {
+        if self.variants.is_empty() {
+            self.text().into_iter().collect()
+        } else {
+            self.variants.iter().map(String::as_str).collect()
+        }
     }
 }
 
@@ -232,6 +258,8 @@ pub struct Call<'c> {
     pub args: &'c [Arg],
     /// Inside a `.then(...)` callback on a fetch/XHR chain.
     pub in_remote_callback: bool,
+    /// Reached through a local helper such as `const sh = c => Executor.execute(c)`.
+    pub via_helper: bool,
 }
 
 impl Call<'_> {
@@ -958,25 +986,32 @@ pub fn classify_import(ctx: &mut RuleContext<'_>, span: Span, source: Option<&Ar
 fn classify_executor(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
     let span = Some(call.span);
     match method {
-        "execute" | "start" | "spawnStream" | "write" => {
+        "execute" | "start" | "spawnStream" => {
             // spawnStream takes an argv array; the resolver joins it.
-            let index = if method == "write" { 1 } else { 0 };
-            let command = call.arg_text(index);
-            classify_command_source(ctx, call, call.arg(index), "Executor");
-            ctx.push(
-                ctx.finding(
-                    "shell.exec",
-                    Severity::High,
-                    Category::Shell,
-                    span,
-                    "Runs shell commands through Executor",
-                    command.unwrap_or("(command built at runtime)"),
-                )
-                .keyed(method),
-            );
-            if let Some(command) = command {
-                classify_command(ctx, call.span, command);
+            let command = call.arg_text(0);
+            classify_command_source(ctx, call, call.arg(0), "Executor");
+            let assessment = assess_arg(call.arg(0));
+            if method == "start" {
+                ctx.facts
+                    .process_starts
+                    .push(assessment.opens_shell || assessment.tier == Tier::Opaque);
             }
+            push_shell_exec(ctx, call, method, command, &assessment);
+            classify_arg_commands(ctx, call.span, call.arg(0));
+        }
+        "write" => {
+            let input = call.arg_text(1);
+            classify_command_source(ctx, call, call.arg(1), "Executor");
+            ctx.facts.process_writes.push(PendingWrite {
+                span: call.span,
+                text: input.map(str::to_string),
+                variants: call
+                    .arg(1)
+                    .map(|arg| arg.variants.clone())
+                    .unwrap_or_default(),
+                via_helper: call.via_helper,
+            });
+            classify_arg_commands(ctx, call.span, call.arg(1));
         }
         "loadLibrary" => ctx.add(
             "shell.load_library",
@@ -1002,14 +1037,165 @@ fn classify_executor(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
     }
 }
 
+fn assess_command(command: Option<&str>) -> Assessment {
+    command.map_or_else(
+        || Assessment::opaque("the whole command is built at runtime"),
+        shell::assess,
+    )
+}
+
+/// The worst grade over every value the command can take.
+fn assess_texts(texts: &[&str]) -> Assessment {
+    texts
+        .iter()
+        .map(|text| shell::assess(text))
+        .max_by_key(|assessment| assessment.tier)
+        .unwrap_or_else(|| assess_command(None))
+}
+
+fn assess_arg(arg: Option<&Arg>) -> Assessment {
+    assess_texts(&arg.map(Arg::command_texts).unwrap_or_default())
+}
+
+fn classify_arg_commands(ctx: &mut RuleContext<'_>, span: Span, arg: Option<&Arg>) {
+    for text in arg.map(Arg::command_texts).unwrap_or_default() {
+        classify_command(ctx, span, text);
+    }
+}
+
+/// One `shell.exec` finding, graded by what the command runs. Commands the
+/// scanner can read in full are Low (read-only) or Medium; only commands it
+/// cannot see (built at runtime, `sh -c $x`, piped into a shell) are High.
+fn push_shell_exec(
+    ctx: &mut RuleContext<'_>,
+    call: &Call<'_>,
+    method: &str,
+    command: Option<&str>,
+    assessment: &Assessment,
+) {
+    push_graded_exec(ctx, call.span, method, command, assessment, call.via_helper);
+}
+
+fn push_graded_exec(
+    ctx: &mut RuleContext<'_>,
+    span: Span,
+    method: &str,
+    command: Option<&str>,
+    assessment: &Assessment,
+    via_helper: bool,
+) {
+    let via = if via_helper {
+        "Executor (through a helper function)"
+    } else {
+        "Executor"
+    };
+    let message = match assessment.tier {
+        Tier::Inspect => format!("Runs read-only shell commands through {via}"),
+        Tier::Program => format!("Runs shell commands through {via}"),
+        Tier::Opaque => format!(
+            "Runs shell commands the scanner cannot fully see through {via}: {}",
+            assessment.reason
+        ),
+    };
+    let key = match assessment.tier {
+        Tier::Opaque => method.to_string(),
+        tier => format!("{method}:{}", tier.key()),
+    };
+    ctx.push(
+        ctx.finding(
+            "shell.exec",
+            assessment.tier.severity(),
+            Category::Shell,
+            Some(span),
+            message,
+            command.unwrap_or("(command built at runtime)"),
+        )
+        .keyed(key),
+    );
+}
+
+/// Grades `Executor.write` calls once the whole file is seen: text written to
+/// a shell is a command, but text written to a program the plugin started
+/// itself (a language server, a kernel driver) is just its input.
+pub fn finish_file(ctx: &mut RuleContext<'_>) {
+    let writes = std::mem::take(&mut ctx.facts.process_writes);
+    let to_shell =
+        ctx.facts.process_starts.is_empty() || ctx.facts.process_starts.iter().any(|shell| *shell);
+    for write in writes {
+        let text = write.text.as_deref();
+        if to_shell {
+            let assessment = if write.variants.is_empty() {
+                assess_command(text)
+            } else {
+                assess_texts(
+                    &write
+                        .variants
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            push_graded_exec(
+                ctx,
+                write.span,
+                "write",
+                text,
+                &assessment,
+                write.via_helper,
+            );
+        } else {
+            ctx.push(
+                ctx.finding(
+                    "shell.exec",
+                    Severity::Low,
+                    Category::Shell,
+                    Some(write.span),
+                    "Sends input to a program it started through Executor (not a shell)",
+                    text.unwrap_or("(input built at runtime)"),
+                )
+                .keyed("write:input"),
+            );
+        }
+    }
+}
+
 fn classify_terminal_module(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
     if method != "write" {
         return;
     }
+    let data = call.arg_text(1);
     classify_command_source(ctx, call, call.arg(1), "the terminal module");
-    if let Some(data) = call.arg_text(1) {
-        classify_command(ctx, call.span, data);
+    // Text typed into a terminal tab the user can see. When none of it is
+    // known it is as likely to be log output as a command, so it stays
+    // Medium; a runtime command followed by Enter (`${cmd}\n`) is High.
+    let mut assessment = assess_arg(call.arg(1));
+    if data.is_none() {
+        assessment = Assessment {
+            tier: Tier::Program,
+            reason: "text built at runtime".to_string(),
+            opens_shell: false,
+        };
     }
+    let message = match assessment.tier {
+        Tier::Inspect => "Types read-only commands into a terminal tab".to_string(),
+        Tier::Program => "Types text or commands into a terminal tab".to_string(),
+        Tier::Opaque => format!(
+            "Types commands the scanner cannot fully see into a terminal tab: {}",
+            assessment.reason
+        ),
+    };
+    ctx.push(
+        ctx.finding(
+            "shell.exec",
+            assessment.tier.severity(),
+            Category::Shell,
+            Some(call.span),
+            message,
+            data.unwrap_or("(text built at runtime)"),
+        )
+        .keyed(format!("terminal.write:{}", assessment.tier.key())),
+    );
+    classify_arg_commands(ctx, call.span, call.arg(1));
 }
 
 /// A command whose text came from the network or a decoder, graded like the
@@ -1086,6 +1272,26 @@ struct CommandRule {
     pattern: Regex,
     /// Matches across lines, so a shell script is checked as a whole too.
     multiline: bool,
+    /// Drops matches that look alike but are harmless (the regex crate has
+    /// no lookahead).
+    counts: Option<fn(&regex::Captures<'_>) -> bool>,
+}
+
+impl CommandRule {
+    fn with_filter(mut self, counts: fn(&regex::Captures<'_>) -> bool) -> Self {
+        self.counts = Some(counts);
+        self
+    }
+
+    fn is_match(&self, command: &str) -> bool {
+        match self.counts {
+            None => self.pattern.is_match(command),
+            Some(counts) => self
+                .pattern
+                .captures_iter(command)
+                .any(|captures| counts(&captures)),
+        }
+    }
 }
 
 static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
@@ -1095,6 +1301,7 @@ static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
         message,
         pattern: Regex::new(&format!("(?i){pattern}")).expect("valid command pattern"),
         multiline: pattern.starts_with("(?s)"),
+        counts: None,
     };
     vec![
         rule(
@@ -1131,8 +1338,14 @@ static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
             "scheduled_persistence",
             Severity::Medium,
             "Schedules commands to run later or at boot",
-            r"\bcrontab\b|/etc/(init\.d|rc\.local|crontabs|periodic)",
-        ),
+            r"\bcrontab\b(\s+-[a-z])?|/etc/(init\.d|rc\.local|crontabs|periodic)",
+        )
+        // `crontab -l` only lists.
+        .with_filter(|captures| {
+            captures
+                .get(1)
+                .is_none_or(|flag| !flag.as_str().ends_with('l'))
+        }),
         rule(
             "download_and_run",
             Severity::Critical,
@@ -1161,14 +1374,22 @@ static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
             "destroy_user_data",
             Severity::Critical,
             "Recursively deletes shared storage or the home directory",
-            r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\s+(/sdcard|/storage|/data/|~|\$HOME|/\*|/(\s|$))",
+            // The folder itself (or everything in it), not a path inside it:
+            // `rm -rf ~/` is destructive, `rm -rf ~/.cache/x` is cleanup.
+            r#"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\s+(--\s+)?["']?((/sdcard|/storage(/emulated(/0)?)?|/data|/mnt/sdcard|~|\$HOME|\$\{HOME\})/?|/)\*?["']?(\s|$|[;&|)])"#,
         ),
         rule(
             "other_app_data",
             Severity::High,
             "Touches another app's private data directory",
-            r"/data/data/|/data/user/\d+/|\brun-as\b",
-        ),
+            r"/data/(data|user/\d+)/([a-z0-9_.]*)|\brun-as\b",
+        )
+        // Acode's own data folder is where the terminal lives.
+        .with_filter(|captures| {
+            captures
+                .get(2)
+                .is_none_or(|package| !package.as_str().starts_with("com.foxdebug.acode"))
+        }),
         rule(
             "privilege_escalation",
             Severity::High,
@@ -1179,7 +1400,8 @@ static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
             "shell_profile_persistence",
             Severity::Medium,
             "Writes to a shell startup file, so the change persists across sessions",
-            r">>?\s*~?/?[^\s]*\.(bashrc|profile|zshrc|ashrc)\b|/etc/profile",
+            // Only writes (`>>`, `tee`), not reads such as `cat /etc/profile`.
+            r#"(>>?|\btee\s+(-a\s+)?)\s*["']?[^\s"';&|]*(\.(bashrc|bash_profile|profile|zshrc|ashrc|mkshrc)|/etc/profile(\.d/[^\s"';&|]+)?)["']?(\s|$|[;&|)])"#,
         ),
     ]
 });
@@ -1195,7 +1417,7 @@ fn classify_command_with(
     include: impl Fn(&CommandRule) -> bool,
 ) {
     for rule in COMMAND_RULES.iter().filter(|rule| include(rule)) {
-        if rule.pattern.is_match(command) {
+        if rule.is_match(command) {
             ctx.push(
                 ctx.finding(
                     "shell.dangerous_command",
@@ -1780,11 +2002,13 @@ fn classify_require(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
     let lower = name.to_ascii_lowercase();
     ctx.facts.required_modules.push(lower.clone());
     let (id, severity, category, message) = match lower.as_str() {
+        // Opening terminal tabs is visible to the user; what gets typed
+        // into them is graded at each `write`.
         "terminal" => (
             "shell.terminal_module",
-            Severity::High,
+            Severity::Medium,
             Category::Shell,
-            "Uses Acode's terminal module (create terminals, write commands)",
+            "Uses Acode's terminal module (opens terminal tabs)",
         ),
         "fs" | "fsoperation" => (
             "filesystem.module",
@@ -2588,6 +2812,50 @@ mod tests {
             .map(|span| span.start_line);
         assert_eq!(line, Some(3));
         assert!(ctx.facts.urls.iter().any(|url| url.contains("e.vil")));
+    }
+
+    #[test]
+    fn dangerous_rules_skip_lookalikes() {
+        let has = |command: &str, rule: &str| {
+            command_ids(command).contains(&format!("shell.dangerous_command:{rule}"))
+        };
+        for command in [
+            "rm -rf /sdcard",
+            "rm -rf /sdcard/",
+            "rm -rf \"$HOME\"",
+            "rm -rf ~/*",
+            "rm -fr /storage/emulated/0/ && echo",
+            "rm -rf /",
+        ] {
+            assert!(has(command, "destroy_user_data"), "{command}");
+        }
+        for command in [
+            "rm -rf ~/.cache/opencode",
+            "rm -rf $HOME/.npm/_cacache",
+            "rm -rf /sdcard/Download/plugin-tmp",
+            "rm -rf /data/user/0/com.foxdebug.acode/files/tmp",
+            "rm -rf ./build",
+        ] {
+            assert!(!has(command, "destroy_user_data"), "{command}");
+        }
+        assert!(has("cat /data/data/com.whatsapp/x", "other_app_data"));
+        assert!(has("ls /data/user/0/", "other_app_data"));
+        assert!(!has(
+            "ls /data/user/0/com.foxdebug.acode.free/files",
+            "other_app_data"
+        ));
+        assert!(has("echo 'x' >> ~/.bashrc", "shell_profile_persistence"));
+        assert!(has(
+            "echo x | tee -a /etc/profile.d/x.sh",
+            "shell_profile_persistence"
+        ));
+        assert!(!has(
+            "cat \"/x/rootfs/etc/profile\"",
+            "shell_profile_persistence"
+        ));
+        assert!(!has(". ~/.profile", "shell_profile_persistence"));
+        assert!(!has("crontab -l", "scheduled_persistence"));
+        assert!(has("crontab -r", "scheduled_persistence"));
     }
 
     #[test]

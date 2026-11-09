@@ -53,11 +53,11 @@ const ARGUMENT_RULES: &[&str] = &[
 /// Every evidence string per stable key, across files.
 fn arguments_by_key(report: &Report) -> BTreeMap<&str, BTreeSet<&str>> {
     let mut map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for finding in report
-        .findings
-        .iter()
-        .filter(|finding| ARGUMENT_RULES.contains(&finding.id.as_str()))
-    {
+    // Low argument findings (read-only shell commands, process input) change
+    // nothing worth a look.
+    for finding in report.findings.iter().filter(|finding| {
+        ARGUMENT_RULES.contains(&finding.id.as_str()) && finding.severity >= Severity::Medium
+    }) {
         let entry = map.entry(finding.key.as_str()).or_default();
         entry.insert(finding.evidence.as_str());
         entry.extend(finding.all_evidence.iter().map(String::as_str));
@@ -246,10 +246,14 @@ pub fn diff(old: &Report, new: &Report) -> DiffReport {
             new_info.id.as_deref().unwrap_or("")
         ));
     }
-    for finding in new_findings
-        .iter()
-        .filter(|finding| finding.severity >= Severity::High)
-    {
+    // A capability whose arguments matter (a shell command, a native action)
+    // is worth a look as soon as it is Medium: a terminal plugin that starts
+    // installing a new package is a new action even though it is not High.
+    for finding in new_findings.iter().filter(|finding| {
+        finding.severity >= Severity::High
+            || (finding.severity >= Severity::Medium
+                && ARGUMENT_RULES.contains(&finding.id.as_str()))
+    }) {
         reasons.push(format!(
             "New {}: {} [{}]",
             finding.severity.label(),
@@ -490,6 +494,50 @@ mod tests {
         moved.file = Some("chunk.js".into());
         let diff = super::diff(&old, &report(vec![moved], Recommendation::Review));
         assert_eq!(diff.recommendation, Recommendation::Pass);
+    }
+
+    #[test]
+    fn graded_shell_commands_gate_updates_by_tier() {
+        let graded = |command: &str, severity: Severity, tier: &str| {
+            Finding::new(
+                "shell.exec",
+                severity,
+                Category::Shell,
+                "Runs shell",
+                command,
+            )
+            .keyed(format!("execute:{tier}"))
+        };
+        let old = report(
+            vec![graded("uname -m", Severity::Low, "inspect")],
+            Recommendation::Pass,
+        );
+        // Another read-only command: nothing to look at.
+        let new = report(
+            vec![
+                graded("uname -m", Severity::Low, "inspect"),
+                graded("cat /tmp/log", Severity::Low, "inspect"),
+            ],
+            Recommendation::Pass,
+        );
+        assert_eq!(diff(&old, &new).recommendation, Recommendation::Pass);
+        // A first command with side effects is new even though it is Medium.
+        let new = report(
+            vec![
+                graded("uname -m", Severity::Low, "inspect"),
+                graded("npm i -g x", Severity::Medium, "program"),
+            ],
+            Recommendation::Pass,
+        );
+        assert_eq!(diff(&old, &new).recommendation, Recommendation::Review);
+        // So is another one under the same key.
+        let old = new;
+        let mut new = report(old.findings.clone(), Recommendation::Pass);
+        new.findings
+            .push(graded("rm -rf /tmp/x", Severity::Medium, "program"));
+        let diff = diff(&old, &new);
+        assert_eq!(diff.recommendation, Recommendation::Review);
+        assert_eq!(diff.new_arguments[0].added, vec!["rm -rf /tmp/x"]);
     }
 
     #[test]
