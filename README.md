@@ -132,8 +132,12 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
   - native binaries detected by magic bytes
   - code under `__MACOSX/`, `.DS_Store` or `Thumbs.db` names, which unzip
     tools hide but Acode installs (real metadata is recognised by its header)
+  - local file headers that disagree with the central directory ("zip
+    cloaking"): Acode and the scanner read the central directory, but tools
+    that read local headers would see different files
 
-  Overwritten entries are still analysed.
+  Overwritten entries are still analysed. Names are decoded as UTF-8, as
+  JSZip does.
 - **Entry resolution like `installPlugin.js` and `loadPlugin.js`.** `main` is
   looked up by exact key, so `"./dist/main.js"` falls back to `main.js`, just
   as on device. The loader then joins the raw `main` onto the plugin folder,
@@ -160,7 +164,7 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
 
 | Area | Rule IDs (severity) |
 | --- | --- |
-| Archive | `install_path_collision` (C), `path_traversal`, `duplicate_entry`, `encrypted_entry`, `unsupported_compression`, `oversized_entry`, `total_size_limit`, `too_many_entries`, `native_binary` (H), `absolute_path`, `nested_archive`, `metadata_path_content` (M) |
+| Archive | `install_path_collision` (C), `path_traversal`, `duplicate_entry`, `encrypted_entry`, `unsupported_compression`, `oversized_entry`, `total_size_limit`, `too_many_entries`, `native_binary`, `header_mismatch` (H), `absolute_path`, `nested_archive`, `metadata_path_content` (M) |
 | Manifest | `missing`, `invalid_json`, `no_entrypoint`, `main_escapes_plugin_dir` (C), `missing_id/name/version`, `readme_password_form` (readme or changelog renders a password form; DOMPurify keeps forms) (H), `invalid_id`, `invalid_version`, `invalid_price`, `invalid_min_version_code`, `missing_icon`, `missing_readme`, `non_js_entry`, `main_loader_mismatch`, `readme_form` (M), `dependencies`, `icon_too_large` (L), `main_fallback` (I) |
 | Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, download-then-chmod, SSH keys / stored credentials, curl file uploads, piping env or files to the network, untrusted package sources, cron/boot persistence, shell-profile persistence), `load_library` (C), `exec` (H/M/L by what the command runs; keys end in `:program`, `:inspect`, or `write:input`), `terminal_module`, `terminal_environment`, `process_control` (M/H), `script_file` (L; shipped `.sh` / `#!` scripts get the same command checks) |
 | Native | `plugin_context_bridge` (`cordova.exec` to `Tee`), `cordova_exec_dynamic` (C), `account_bridge` (`Authenticator`; C for `saveToken`, else H), `cordova_exec`, `manage_all_files`, `in_app_purchase` (H), `permission_request`, `launch_app`, `intent_access`, `purchase_read`, `cordova_require`, `cordova_plugin` (M), `file_intent`, `device_setting`, `os_integration` (L) |
@@ -181,7 +185,7 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 {
   "schema_version": 2,
   "scanner_version": "0.4.0",
-  "rules_version": "2026.11.1",        // rescan stored plugins when this changes
+  "rules_version": "2026.11.2",        // rescan stored plugins when this changes
   "plugin": { "id", "name", "version", "main", "entry", "permissions", "dependencies", ... },
   "verdict": { "risk": "high", "recommendation": "review", "complete": true, "reasons": ["..."] },
   "summary": { "total_findings", "by_severity", "by_category" },

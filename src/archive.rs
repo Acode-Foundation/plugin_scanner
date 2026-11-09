@@ -23,7 +23,11 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zip::{CompressionMethod, ZipArchive};
+use zip::{
+    CompressionMethod, ZipReadOptions,
+    read::Config,
+    unstable::read::{ZipIterable, ZipIterableFiles},
+};
 
 use crate::{
     report::{FileEntry, Finding, Report},
@@ -84,23 +88,30 @@ impl PluginArchive {
     }
 
     pub fn from_reader<R: Read + Seek>(
-        reader: R,
+        mut reader: R,
         limits: Limits,
         report: &mut Report,
     ) -> Result<Self, ArchiveError> {
-        let mut zip = ZipArchive::new(reader)?;
+        check_header_consistency(&mut reader, limits, report)?;
+
+        // `ZipIterable` walks the central directory in order and keeps
+        // duplicate names, like JSZip. (`ZipArchive` indexes entries by name
+        // and drops duplicates, which would hide the copy that gets installed.)
+        let mut zip = ZipIterable::try_new(&mut reader, Config::default())?;
+        let entry_count = zip.len();
+        let entries = zip.files()?;
         let mut archive = Self::default();
         let mut total_bytes = 0u64;
-        report.stats.archive_entries = zip.len();
+        report.stats.archive_entries = entry_count;
 
-        if zip.len() > limits.max_entries {
+        if entry_count > limits.max_entries {
             report.push(
                 Finding::new(
                     "archive.too_many_entries",
                     Severity::High,
                     Category::Archive,
                     "Archive has more entries than the scanner will read",
-                    format!("{} entries, limit {}", zip.len(), limits.max_entries),
+                    format!("{entry_count} entries, limit {}", limits.max_entries),
                 )
                 .with_file("archive"),
             );
@@ -110,21 +121,25 @@ impl PluginArchive {
         // Paths written by more than one distinct raw key.
         let mut writers: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-        for index in 0..zip.len().min(limits.max_entries) {
-            let meta = match zip.by_index_raw(index) {
-                Ok(entry) => EntryMeta {
-                    name: entry.name().to_string(),
-                    is_dir: entry.is_dir(),
-                    encrypted: entry.encrypted(),
-                    compression: entry.compression(),
-                    size: entry.size(),
-                    compressed: entry.compressed_size(),
-                },
-                Err(error) => {
+        for index in 0..entry_count.min(limits.max_entries) {
+            let entry = match entries.next() {
+                Some(Ok(entry)) => entry,
+                Some(Err(error)) => {
+                    // The central directory can't be walked past a bad record.
                     report.error(Some("archive"), format!("entry #{index}: {error}"));
                     report.mark_incomplete();
-                    continue;
+                    break;
                 }
+                None => break,
+            };
+            let meta = EntryMeta {
+                // JSZip decodes names as UTF-8 whatever the encoding flag says.
+                name: String::from_utf8_lossy(entry.name_raw()).into_owned(),
+                is_dir: entry.is_dir(),
+                encrypted: entry.encrypted(),
+                compression: entry.compression(),
+                size: entry.size(),
+                compressed: entry.compressed_size(),
             };
             let raw = meta.name.clone();
 
@@ -234,12 +249,7 @@ impl PluginArchive {
 
             // The declared size can lie, so cap the read itself.
             let mut bytes = Vec::with_capacity(meta.size.min(limits.max_entry_bytes) as usize);
-            let read = zip.by_index(index).and_then(|entry| {
-                entry
-                    .take(limits.max_entry_bytes + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(Into::into)
-            });
+            let read = read_entry(entries, entry, limits.max_entry_bytes + 1, &mut bytes);
             if let Err(error) = read {
                 report.error(Some(&path), format!("failed to read entry: {error}"));
                 report.mark_incomplete();
@@ -402,6 +412,56 @@ impl PluginArchive {
     }
 }
 
+/// Reads one entry's content, capped at `limit` bytes.
+fn read_entry<R: Read + Seek>(
+    entries: &mut ZipIterableFiles<R>,
+    entry: zip::read::ZipFileEntry<'static>,
+    limit: u64,
+    bytes: &mut Vec<u8>,
+) -> zip::result::ZipResult<()> {
+    let file = entry.with_reader(entries.reader_mut(), ZipReadOptions::new())?;
+    file.take(limit).read_to_end(bytes)?;
+    Ok(())
+}
+
+/// Compares every local file header with its central-directory record.
+///
+/// Acode (JSZip) and this scanner both trust the central directory, but
+/// tools that stream local headers (and some unzip tools reviewers use) do
+/// not. When the two disagree on a name, compression, flags, or sizes, the
+/// zip shows different files to different readers ("zip cloaking"). This is a
+/// separate pass because a failed check stops a pass, and the main read should
+/// still see every entry.
+fn check_header_consistency<R: Read + Seek>(
+    reader: &mut R,
+    limits: Limits,
+    report: &mut Report,
+) -> Result<(), ArchiveError> {
+    let mut zip =
+        ZipIterable::try_new(&mut *reader, Config::default())?.enforce_header_consistency(true);
+    for (index, entry) in zip.files()?.take(limits.max_entries).enumerate() {
+        let Err(error) = entry else {
+            continue;
+        };
+        let message = error.to_string();
+        if message.contains("header inconsistency") {
+            report.push(
+                Finding::new(
+                    "archive.header_mismatch",
+                    Severity::High,
+                    Category::Archive,
+                    "Local file header disagrees with the central directory, so other zip tools can see different files than Acode installs",
+                    format!("entry #{index}: {message}"),
+                )
+                .with_file("archive"),
+            );
+        }
+        // Other errors stop the main pass too, which reports them.
+        break;
+    }
+    Ok(())
+}
+
 struct EntryMeta {
     name: String,
     is_dir: bool,
@@ -542,6 +602,112 @@ mod tests {
         let mut report = Report::new();
         let archive = PluginArchive::from_reader(cursor, Limits::default(), &mut report).unwrap();
         (archive, report)
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A stored zip written by hand, so tests can build what ZipWriter
+    /// refuses to: duplicate names, and local headers that disagree with the
+    /// central directory. Entries are (central name, local name, content).
+    fn raw_zip(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (central_name, local_name, data) in entries {
+            let offset = out.len() as u32;
+            let (crc, size) = (crc32(data), data.len() as u32);
+            out.extend(0x0403_4b50u32.to_le_bytes());
+            out.extend([20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            out.extend(crc.to_le_bytes());
+            out.extend(size.to_le_bytes());
+            out.extend(size.to_le_bytes());
+            out.extend((local_name.len() as u16).to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+            out.extend(local_name.as_bytes());
+            out.extend(*data);
+
+            central.extend(0x0201_4b50u32.to_le_bytes());
+            central.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            central.extend(crc.to_le_bytes());
+            central.extend(size.to_le_bytes());
+            central.extend(size.to_le_bytes());
+            central.extend((central_name.len() as u16).to_le_bytes());
+            central.extend([0u8; 12]);
+            central.extend(offset.to_le_bytes());
+            central.extend(central_name.as_bytes());
+        }
+        let (start, length) = (out.len() as u32, central.len() as u32);
+        out.extend(central);
+        out.extend(0x0605_4b50u32.to_le_bytes());
+        out.extend([0u8; 4]);
+        out.extend((entries.len() as u16).to_le_bytes());
+        out.extend((entries.len() as u16).to_le_bytes());
+        out.extend(length.to_le_bytes());
+        out.extend(start.to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        out
+    }
+
+    fn read_raw(entries: &[(&str, &str, &[u8])]) -> (PluginArchive, Report) {
+        let mut report = Report::new();
+        let archive = PluginArchive::from_reader(
+            Cursor::new(raw_zip(entries)),
+            Limits::default(),
+            &mut report,
+        )
+        .unwrap();
+        (archive, report)
+    }
+
+    #[test]
+    fn keeps_every_copy_of_a_duplicate_name() {
+        let (archive, report) = read_raw(&[
+            ("main.js", "main.js", b"safe()"),
+            ("main.js", "main.js", b"Executor.execute('id')"),
+        ]);
+        assert!(report.has("archive.duplicate_entry"));
+        assert!(!report.has("archive.header_mismatch"));
+        // JSZip keeps the last copy, for install and for lookups.
+        assert_eq!(
+            archive.installed("main.js").unwrap().bytes,
+            b"Executor.execute('id')"
+        );
+        assert_eq!(
+            archive.by_key("main.js").unwrap().bytes,
+            b"Executor.execute('id')"
+        );
+        // The overwritten copy is still analysed.
+        assert_eq!(archive.javascript_files().len(), 2);
+    }
+
+    #[test]
+    fn flags_local_headers_that_disagree_with_the_central_directory() {
+        let (archive, report) = read_raw(&[
+            ("plugin.json", "plugin.json", b"{}"),
+            ("main.js", "readme.txt", b"eval(atob(p))"),
+        ]);
+        assert!(
+            report.has("archive.header_mismatch"),
+            "{:?}",
+            report.findings
+        );
+        // What Acode installs (central-directory names) is still scanned.
+        assert!(archive.installed("main.js").is_some());
+
+        let (_, report) = read_raw(&[("main.js", "main.js", b"x")]);
+        assert!(!report.has("archive.header_mismatch"));
     }
 
     #[test]
