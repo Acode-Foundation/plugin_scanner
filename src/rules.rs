@@ -2955,10 +2955,10 @@ mod tests {
         assert_eq!(tag("https://abc.ngrok-free.app/x"), Some("tunnel"));
         assert_eq!(tag("http://45.12.1.9:8080/p"), Some("raw-ip"));
         assert_eq!(tag("http://127.0.0.1:3000"), Some("local"));
+        // Built at runtime so no token-shaped literal sits in the source.
+        let token = format!("{}:{}", "1".repeat(9), "x".repeat(35));
         assert_eq!(
-            tag(
-                "https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage"
-            ),
+            tag(&format!("https://api.telegram.org/bot{token}/sendMessage")),
             Some("webhook")
         );
         assert_eq!(tag("https://api.telegram.org/bot"), Some("bot-api"));
