@@ -98,13 +98,28 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
     reading `/etc/profile` is not persistence; Acode's own
     `/data/data/com.foxdebug.acode…` folder is not another app's.
 - **Shell helpers are followed.** In `const sh = c => Executor.execute(c)`,
-  each `sh("…")` call is graded with its own command. When every use of the
-  helper is a direct call, the helper's body adds no finding of its own. The
+  each `sh("…")` call is graded with its own command, also when the sink sits
+  in a callback inside the helper (`new Promise(r => Executor.start(cmd, …))`).
+  When every use of the helper is a direct call, the helper's body adds no
+  finding of its own. The
   scanner also follows `this.run(cmd)` methods, getters such as
   `getExecutor()`, quoting helpers (`'${s.replace(/'/g, …)}'`,
   `JSON.stringify`), functions that build a script from a template, `$VAR`
-  names assigned earlier in the same script, and every branch of
-  `a ? "x" : "y"`.
+  names assigned earlier in the same script, every branch of
+  `a ? "x" : "y"`, and `btoa(…)` or a local base64 helper that ends in `btoa`.
+- **Encoded and staged scripts are opened.** Base64 piped through
+  `base64 -d` in a command (`printf %s <b64> | base64 -d > /tmp/x.sh`,
+  `echo <b64> | base64 -d | sh`) is decoded and checked like any other command
+  (`encoded_script`). When a file is written with content the scanner can't
+  read and is then run (`sh /tmp/x.sh`, from Executor or a terminal tab), that
+  is `staged_script` (H), and the file's multi-line, script-shaped constants are
+  checked as the likely content.
+- **Source built at runtime is listed.** `git clone` followed by a build
+  (`make`, `cmake`, `npm install`, `cargo build`, …), `pip install git+…`, and
+  `npm install github:…` are `builds_remote_source`, naming each repository
+  (`for R in a b c; do git clone …/$R` loops are expanded). Medium when
+  unpinned, Low when pinned to a tag or commit (`--branch v1.2`,
+  `git checkout <sha>`, `pkg@<ref>`).
 - **Process input is not a command.** Text written with `Executor.write` to a
   program the plugin started (a language server, a kernel driver) is input
   (Low). It is graded as a command only when the started process is a shell
@@ -174,7 +189,7 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
 | --- | --- |
 | Archive | `install_path_collision` (C), `path_traversal`, `duplicate_entry`, `encrypted_entry`, `unsupported_compression`, `oversized_entry`, `total_size_limit`, `too_many_entries`, `native_binary`, `header_mismatch` (H), `absolute_path`, `nested_archive`, `metadata_path_content` (M) |
 | Manifest | `missing`, `invalid_json`, `no_entrypoint`, `main_escapes_plugin_dir` (C), `missing_id/name/version`, `readme_password_form` (readme or changelog renders a password form; DOMPurify keeps forms) (H), `invalid_id`, `invalid_version`, `invalid_price`, `invalid_min_version_code`, `missing_icon`, `missing_readme`, `non_js_entry`, `main_loader_mismatch`, `readme_form` (M), `dependencies`, `icon_too_large` (L), `main_fallback` (I) |
-| Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, download-then-chmod, SSH keys / stored credentials, curl file uploads, piping env or files to the network, untrusted package sources, cron/boot persistence, shell-profile persistence), `load_library` (C), `exec` (H/M/L by what the command runs; keys end in `:program`, `:inspect`, or `write:input`), `terminal_module`, `terminal_environment`, `process_control` (M/H), `script_file` (L; shipped `.sh` / `#!` scripts get the same command checks) |
+| Shell | `remote_command` (C), `decoded_command` (H), `dangerous_command` (C/H/M: download-and-run, decode-and-run, reverse shell, miner, wiping `/sdcard`/`$HOME`, other apps' data, `su`, download-then-chmod, SSH keys / stored credentials, curl file uploads, piping env or files to the network, untrusted package sources, cron/boot persistence, shell-profile persistence), `load_library` (C), `exec` (H/M/L by what the command runs; keys end in `:program`, `:inspect`, or `write:input`), `terminal_module`, `terminal_environment`, `process_control` (M/H), `staged_script` (H), `encoded_script`, `builds_remote_source` (M; L when pinned), `script_file` (L; shipped `.sh` / `#!` scripts get the same command checks) |
 | Native | `plugin_context_bridge` (`cordova.exec` to `Tee`), `cordova_exec_dynamic` (C), `account_bridge` (`Authenticator`; C for `saveToken`, else H), `cordova_exec`, `manage_all_files`, `in_app_purchase` (H), `permission_request`, `launch_app`, `intent_access`, `purchase_read`, `cordova_require`, `cordova_plugin` (M), `file_intent`, `device_setting`, `os_integration` (L) |
 | Tampering | `core_module_override` (`acode.define("fs")` etc.) (C), `self_modify` (writes scripts or `plugin.json` where code is loaded from; C when the content is downloaded or it rewrites the entry/manifest, else H), `acode_api`, `cordova_bridge`, `network_hook`, `native_api` (hooks `system`, `Executor`, `sdcard`…), `dom_hook` (wraps `addEventListener`, `appendChild`, input `value`…), `ads`, `plugin_settings` (edits `pluginsDisabled`), `other_plugin`, `plugin_files` (writes into another plugin's folder), `rewards` (H), `editor_manager`, `define_dynamic`, `unmount_dynamic` (M) |
 | Dynamic code | `remote_code`, `remote_import` (C), `remote_script`, `remote_worker`, `decoded_exec`, `indirect_function_constructor` (H), `eval`, `function_constructor`, `inline_script`, `script_blob`, `html_script`, `remote_html`, `decoded_html` (M: `innerHTML`, `insertAdjacentHTML`, `createContextualFragment`, `srcdoc`, `on*` attributes), `string_timer`, `script_element`, `import_expression`, `inline_handler` (L) |
@@ -193,7 +208,7 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 {
   "schema_version": 2,
   "scanner_version": "0.4.1",
-  "rules_version": "2026.11.3",        // rescan stored plugins when this changes
+  "rules_version": "2026.11.4",        // rescan stored plugins when this changes
   "plugin": { "id", "name", "version", "main", "entry", "permissions", "dependencies", ... },
   "verdict": { "risk": "high", "recommendation": "review", "complete": true, "reasons": ["..."] },
   "summary": { "total_findings", "by_severity", "by_category" },
