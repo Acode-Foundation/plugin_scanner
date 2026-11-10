@@ -105,6 +105,9 @@ pub struct FileFacts {
     /// Reads data worth stealing: files, editor text, cookies, purchases, clipboard.
     pub reads_sensitive_data: bool,
     pub listens_to_keys: bool,
+    /// Whether the file dumps all of localStorage / sessionStorage; computed
+    /// on the first storage reference.
+    pub web_storage_dump: Option<bool>,
     pub minified: bool,
     /// WebAssembly modules inlined as base64 strings.
     pub embedded_wasm: Vec<Vec<u8>>,
@@ -738,6 +741,31 @@ fn classify_fallback(ctx: &mut RuleContext<'_>, call: &Call<'_>) {
         .with_confidence(Confidence::Low),
     );
 }
+
+/// Code that walks or serialises the whole of web storage rather than
+/// reading keys by name.
+static WEB_STORAGE_DUMP: LazyLock<Regex> = LazyLock::new(|| {
+    let storage = r"(?:(?:window|globalThis|self)\s*\.\s*)?(?:local|session)Storage\b";
+    Regex::new(&format!(
+        r"Object\s*\.\s*(?:keys|values|entries|assign|getOwnPropertyNames)\s*\([^)]*?{storage}|JSON\s*\.\s*stringify\s*\(\s*{storage}\s*[,)]|\.\.\.\s*{storage}|\bin\s+{storage}|{storage}\s*\.\s*key\s*\("
+    ))
+    .unwrap()
+});
+
+/// A Telegram bot token (`<bot id>:<35-char secret>`) written into the plugin.
+static TELEGRAM_BOT_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^0-9A-Za-z_-])(\d{6,12}:[A-Za-z0-9_-]{30,50})(?:$|[^A-Za-z0-9_-])").unwrap()
+});
+
+/// Webhook and bot URLs that carry their secret in the URL itself. Written into
+/// the plugin, they point at a channel the plugin author controls; built from
+/// a token the user enters at runtime, they point at the user's own bot.
+static WEBHOOK_WITH_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)api\.telegram\.org/(?:file/)?bot\d+:[a-z0-9_-]+|discord(?:app)?\.com/api/webhooks/[^/\s]+/[^/\s?#]+|hooks\.slack\.com/(?:services|workflows|triggers)/[^\s?#]+|script\.google\.com/macros/s/[a-z0-9_-]+",
+    )
+    .unwrap()
+});
 
 static INLINE_HANDLER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)[\s"'/]on[a-z]+\s*=|javascript:"#).expect("valid handler pattern")
@@ -2233,7 +2261,23 @@ pub fn classify_tamper_target(ctx: &mut RuleContext<'_>, span: Span, target: &st
 pub fn classify_reference(ctx: &mut RuleContext<'_>, name: &str, span: Span) {
     let (id, severity, category, message) = match name {
         "localStorage" | "sessionStorage" => {
-            ctx.facts.reads_sensitive_data = true;
+            // A plugin reading its own keys is not user data. Dumping every
+            // key reads other plugins' and Acode's saved state, so that counts.
+            if ctx.facts.web_storage_dump.is_none() {
+                let dump = WEB_STORAGE_DUMP.find(ctx.source);
+                ctx.facts.web_storage_dump = Some(dump.is_some());
+                if let Some(dump) = dump {
+                    ctx.facts.reads_sensitive_data = true;
+                    ctx.add(
+                        "storage.web_storage_dump",
+                        Severity::Medium,
+                        Category::Storage,
+                        Some(Span::new(dump.start() as u32, dump.end() as u32)),
+                        "Reads every localStorage / sessionStorage entry, including other plugins' saved data",
+                        shorten(dump.as_str(), 120),
+                    );
+                }
+            }
             (
                 "storage.web_storage",
                 Severity::Info,
@@ -2275,6 +2319,23 @@ pub fn classify_reference(ctx: &mut RuleContext<'_>, name: &str, span: Span) {
 pub fn classify_string(ctx: &mut RuleContext<'_>, value: &str, span: Span) {
     if value.len() >= 8 && value.contains("://") {
         ctx.facts.urls.extend(extract_urls(value));
+    }
+    if value.len() >= 37
+        && let Some(token) = TELEGRAM_BOT_TOKEN.captures(value).and_then(|c| c.get(1))
+    {
+        let token = token.as_str();
+        let (bot, _) = token.split_once(':').unwrap_or((token, ""));
+        ctx.push(
+            ctx.finding(
+                "network.hardcoded_bot_token",
+                Severity::High,
+                Category::Network,
+                Some(span),
+                "Contains a hardcoded Telegram bot token, so messages it sends go to the plugin author's bot",
+                format!("bot {bot}:…"),
+            )
+            .keyed("api.telegram.org"),
+        );
     }
     if let Some(module) = decode_wasm_payload(value) {
         if ctx.facts.embedded_wasm.len() < MAX_EMBEDDED_WASM {
@@ -2557,33 +2618,49 @@ pub fn classify_endpoint(url: &str, host: &str) -> Option<EndpointRisk> {
         })
     };
 
+    if WEBHOOK_WITH_SECRET.is_match(&lower) {
+        return risk(
+            "webhook",
+            Some(Severity::High),
+            "Sends data to a webhook / bot whose secret is hardcoded in the plugin (a channel the author controls)",
+        );
+    }
     if [
         "discord.com/api/webhooks",
         "discordapp.com/api/webhooks",
         "api.telegram.org/bot",
-        "hooks.slack.com/services",
+        "api.telegram.org/file/bot",
+        "hooks.slack.com/",
         "script.google.com/macros",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
-        || host_is(&[
-            "webhook.site",
-            "pipedream.net",
-            "requestbin.com",
-            "requestcatcher.com",
-            "beeceptor.com",
-            "interact.sh",
-            "oast.fun",
-            "oast.pro",
-            "oast.live",
-            "oast.site",
-            "oast.online",
-            "oast.me",
-            "burpcollaborator.net",
-            "canarytokens.com",
-            "hookbin.com",
-        ])
     {
+        // Only the API base is in the plugin; the secret comes from somewhere
+        // else at runtime, usually the user's own settings.
+        return risk(
+            "bot-api",
+            Some(Severity::Low),
+            "Uses a bot / webhook API with a token supplied at runtime",
+        );
+    }
+    if host_is(&[
+        "webhook.site",
+        "pipedream.net",
+        "requestbin.com",
+        "requestcatcher.com",
+        "beeceptor.com",
+        "interact.sh",
+        "oast.fun",
+        "oast.pro",
+        "oast.live",
+        "oast.site",
+        "oast.online",
+        "oast.me",
+        "burpcollaborator.net",
+        "canarytokens.com",
+        "hookbin.com",
+    ]) {
         return risk(
             "webhook",
             Some(Severity::High),
@@ -2878,6 +2955,18 @@ mod tests {
         assert_eq!(tag("https://abc.ngrok-free.app/x"), Some("tunnel"));
         assert_eq!(tag("http://45.12.1.9:8080/p"), Some("raw-ip"));
         assert_eq!(tag("http://127.0.0.1:3000"), Some("local"));
+        assert_eq!(
+            tag(
+                "https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage"
+            ),
+            Some("webhook")
+        );
+        assert_eq!(tag("https://api.telegram.org/bot"), Some("bot-api"));
+        assert_eq!(tag("https://discord.com/api/webhooks/"), Some("bot-api"));
+        assert_eq!(
+            tag("https://script.google.com/macros/s/AKfycbx1abc/exec"),
+            Some("webhook")
+        );
         assert_eq!(tag("https://discord.com/invite/x"), None);
         assert_eq!(tag("https://acode.app/api"), None);
     }
