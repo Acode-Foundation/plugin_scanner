@@ -116,6 +116,13 @@ pub struct FileFacts {
     pub process_starts: Vec<bool>,
     /// `Executor.write` calls, graded once every `start` in the file is known.
     pub process_writes: Vec<PendingWrite>,
+    /// Files a command writes a script into: (path, whether its content was
+    /// readable, where).
+    pub staged_files: Vec<(String, bool, Span)>,
+    /// Files a command runs as a script: (path, where).
+    pub run_files: Vec<(String, Span)>,
+    /// Multi-line string constants that read like shell scripts.
+    pub script_constants: Vec<(String, Span)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1146,6 +1153,7 @@ fn push_graded_exec(
 /// a shell is a command, but text written to a program the plugin started
 /// itself (a language server, a kernel driver) is just its input.
 pub fn finish_file(ctx: &mut RuleContext<'_>) {
+    finish_staged_scripts(ctx);
     let writes = std::mem::take(&mut ctx.facts.process_writes);
     let to_shell =
         ctx.facts.process_starts.is_empty() || ctx.facts.process_starts.iter().any(|shell| *shell);
@@ -1184,6 +1192,43 @@ pub fn finish_file(ctx: &mut RuleContext<'_>) {
                 .keyed("write:input"),
             );
         }
+    }
+}
+
+/// A script written to a file and then run with `sh <file>`. When the
+/// scanner couldn't read what was written, the file's script-shaped constants
+/// are checked as the likely content, and the pair is reported on its own.
+fn finish_staged_scripts(ctx: &mut RuleContext<'_>) {
+    let staged = std::mem::take(&mut ctx.facts.staged_files);
+    let runs = std::mem::take(&mut ctx.facts.run_files);
+    let hidden: Vec<(&String, Span)> = staged
+        .iter()
+        .filter(|(path, known, _)| !known && runs.iter().any(|(run, _)| run == path))
+        .map(|(path, _, span)| (path, *span))
+        .collect();
+    if hidden.is_empty() {
+        return;
+    }
+    for (path, span) in &hidden {
+        let run = runs
+            .iter()
+            .find(|(run, _)| run == *path)
+            .map(|(_, span)| ctx.snippet(*span))
+            .unwrap_or_default();
+        ctx.push(
+            ctx.finding(
+                "shell.staged_script",
+                Severity::High,
+                Category::Shell,
+                Some(*span),
+                "Writes a script it builds at runtime to a file and then runs it, so the scanner can't read the script",
+                format!("{path} (run by: {})", shorten(&run, 120)),
+            )
+            .keyed(path.as_str()),
+        );
+    }
+    for (script, span) in std::mem::take(&mut ctx.facts.script_constants) {
+        classify_command_at(ctx, span, &script, 3);
     }
 }
 
@@ -1435,7 +1480,222 @@ static COMMAND_RULES: LazyLock<Vec<CommandRule>> = LazyLock::new(|| {
 });
 
 fn classify_command(ctx: &mut RuleContext<'_>, span: Span, command: &str) {
+    classify_command_at(ctx, span, command, 0);
+}
+
+fn classify_command_at(ctx: &mut RuleContext<'_>, span: Span, command: &str, depth: u8) {
     classify_command_with(ctx, span, command, |_| true);
+    classify_remote_build(ctx, span, command);
+    if depth < 3 {
+        classify_staging(ctx, span, command, depth);
+    }
+}
+
+/// `printf %s <base64> | base64 -d …` and `echo <base64> | base64 -d …`.
+static BASE64_PIPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:printf\s+(?:'%s'|"%s"|%s)|echo(?:\s+-[ne]+)?)\s+['"]?([A-Za-z0-9+/=…]{8,}|…)['"]?\s*\|\s*base64\s+(?:-d|--decode|-D)\b([^;&|\n]*)"#,
+    )
+    .unwrap()
+});
+/// `> /path/file` redirection target.
+static REDIRECT_TARGET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#">>?\s*['"]?([^\s'";&|]+)"#).unwrap());
+/// `sh /path/x.sh`, `bash x`, `source x`, `. x`.
+static RUN_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|[;&|(]\s*|\s)(?:sh|bash|ash|dash|zsh|source|\.)\s+['"]?(/[^\s'";&|)]+)"#)
+        .unwrap()
+});
+
+/// Decodes base64 written by a command and grades what it decodes to. Records
+/// the file it lands in, so a later `sh <file>` can be tied back to it.
+fn classify_staging(ctx: &mut RuleContext<'_>, span: Span, command: &str, depth: u8) {
+    for captures in BASE64_PIPE.captures_iter(command) {
+        let payload = &captures[1];
+        let decoded = (!payload.contains('…'))
+            .then(|| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(payload.trim_end_matches('…'))
+                    .ok()
+            })
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        if let Some(target) = REDIRECT_TARGET.captures(&captures[2]) {
+            ctx.facts
+                .staged_files
+                .push((target[1].to_string(), decoded.is_some(), span));
+        }
+        if let Some(script) = decoded {
+            ctx.push(
+                ctx.finding(
+                    "shell.encoded_script",
+                    Severity::Medium,
+                    Category::Shell,
+                    Some(span),
+                    "Passes a base64-encoded script through the shell (decoded and checked)",
+                    script.clone(),
+                )
+                .keyed("base64"),
+            );
+            classify_command_at(ctx, span, &script, depth + 1);
+        }
+    }
+    for captures in RUN_FILE.captures_iter(command) {
+        ctx.facts.run_files.push((captures[1].to_string(), span));
+    }
+}
+
+/// `git clone` / `pip install git+…` / `npm install github:…`: source fetched
+/// at runtime and then built or installed.
+static GIT_CLONE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bgit\s+clone\b([^;&|\n]*)").unwrap());
+static REMOTE_PACKAGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"\b(?:pip3?|python3?\s+-m\s+pip|uv\s+pip)\s+install\b[^;&|\n]*?\b(git\+[^\s'";&|]+)|\b(?:npm|pnpm|yarn)\s+(?:i|install|add)\b[^;&|\n]*?\s((?:github:|git\+)[^\s'";&|]+|https://github\.com/[^\s'";&|]+)"#,
+    )
+    .unwrap()
+});
+static BUILD_STEP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)(?:^|[;&|]\s*|\s)(?:make|cmake|ninja|meson|cargo\s+(?:build|install)|go\s+(?:build|install)|npm\s+(?:install|ci|run)|pnpm\s+(?:install|run)|yarn(?:\s+install)?|pip3?\s+install\s+(?:-e\s+)?\.|python3?\s+setup\.py|\./configure|\./gradlew|gradle|\./[\w.-]*build[\w.-]*\.sh|sh\s+[\w./-]*build[\w.-]*\.sh)\b",
+    )
+    .unwrap()
+});
+static FOR_LIST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bfor\s+(\w+)\s+in\s+([^;\n]+?)\s*(?:;|\n)\s*do\b").unwrap());
+static PINNED_CHECKOUT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\bgit\b[^;&|\n]*\b(?:checkout|reset\s+--hard|switch\s+--detach)\s+[0-9a-f]{7,40}\b",
+    )
+    .unwrap()
+});
+
+fn classify_remote_build(ctx: &mut RuleContext<'_>, span: Span, command: &str) {
+    let loops: Vec<(String, Vec<String>)> = FOR_LIST
+        .captures_iter(command)
+        .map(|captures| {
+            (
+                captures[1].to_string(),
+                captures[2].split_whitespace().map(str::to_string).collect(),
+            )
+        })
+        .collect();
+    // `https://github.com/$R` with `for R in a/b c/d` expands to both repos.
+    let expand = |source: &str| -> Vec<String> {
+        for (var, items) in &loops {
+            for form in [format!("${{{var}}}"), format!("${var}")] {
+                if source.contains(&form) {
+                    return items
+                        .iter()
+                        .map(|item| source.replace(&form, item))
+                        .collect();
+                }
+            }
+        }
+        vec![source.to_string()]
+    };
+
+    let mut sources = Vec::new();
+    let mut pinned = PINNED_CHECKOUT.is_match(command);
+    let mut clones = false;
+    if BUILD_STEP.is_match(command) {
+        for captures in GIT_CLONE.captures_iter(command) {
+            let words: Vec<&str> = captures[1]
+                .split_whitespace()
+                .map(|word| word.trim_matches(['"', '\'']))
+                .collect();
+            let mut index = 0;
+            let mut repo = None;
+            while index < words.len() {
+                let word = words[index];
+                if matches!(word, "-b" | "--branch") {
+                    let reference = words.get(index + 1).copied().unwrap_or("");
+                    pinned |= !matches!(
+                        reference,
+                        "" | "main" | "master" | "HEAD" | "trunk" | "develop" | "dev"
+                    );
+                    index += 2;
+                    continue;
+                }
+                if matches!(
+                    word,
+                    "--depth" | "-c" | "--config" | "-o" | "--origin" | "--reference"
+                ) {
+                    index += 2;
+                    continue;
+                }
+                if !word.starts_with('-') {
+                    repo = Some(word);
+                    break;
+                }
+                index += 1;
+            }
+            if let Some(repo) = repo {
+                clones = true;
+                sources.extend(expand(repo));
+            }
+        }
+    }
+    for captures in REMOTE_PACKAGE.captures_iter(command) {
+        if let Some(source) = captures.get(1).or_else(|| captures.get(2)) {
+            let source = source.as_str();
+            // `pkg@<sha>` / `#<sha>` / `@v1.2` pin a package to one version.
+            pinned |= source.rsplit(['@', '#']).next().is_some_and(|reference| {
+                reference != source && !matches!(reference, "main" | "master" | "HEAD")
+            });
+            sources.extend(expand(source));
+        }
+    }
+    if sources.is_empty() {
+        return;
+    }
+    sources.sort();
+    sources.dedup();
+    let (severity, state) = if pinned {
+        (Severity::Low, "pinned")
+    } else {
+        (Severity::Medium, "unpinned")
+    };
+    let what = if clones {
+        "Clones source code at runtime and builds it"
+    } else {
+        "Installs packages straight from a git repository at runtime"
+    };
+    let message = if pinned {
+        format!("{what} (pinned to a tag or commit)")
+    } else {
+        format!("{what}: unpinned, so it runs whatever those repositories hold at install time")
+    };
+    ctx.push(
+        ctx.finding(
+            "shell.builds_remote_source",
+            severity,
+            Category::Shell,
+            Some(span),
+            message,
+            format!("{} ({state})", sources.join(", ")),
+        )
+        .keyed(sources.join(",")),
+    );
+}
+
+/// A multi-line string with several lines that start with a shell command.
+pub fn looks_like_shell_script(text: &str) -> bool {
+    const STARTS: &[&str] = &[
+        "set ", "export ", "echo ", "cd ", "rm ", "mkdir ", "cp ", "mv ", "chmod ", "apk ", "apt",
+        "pkg ", "pip", "npm ", "git ", "curl ", "wget ", "make", "cmake ", "if ", "for ", "done",
+        "fi", "case ", "exec ", "sh ", "bash ", "tar ", "sed ", "grep ", "#!",
+    ];
+    if !text.contains('\n') || text.len() > 64 * 1024 {
+        return false;
+    }
+    text.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            STARTS.iter().any(|start| line.starts_with(start))
+        })
+        .count()
+        >= 3
 }
 
 fn classify_command_with(
@@ -1503,6 +1763,7 @@ pub fn scan_shell_script(ctx: &mut RuleContext<'_>) {
         start = end;
     }
     classify_command_with(ctx, Span::new(0, 0), source, |rule| rule.multiline);
+    classify_remote_build(ctx, Span::new(0, 0), source);
 }
 
 fn classify_system(ctx: &mut RuleContext<'_>, call: &Call<'_>, method: &str) {
@@ -2943,6 +3204,65 @@ mod tests {
         assert!(command_ids("chmod +x ./gradlew && ./gradlew build").is_empty());
         assert!(command_ids("pip install --index-url https://pypi.org/simple black").is_empty());
         assert!(command_ids("curl -d '{\"a\":1}' https://api.example.com").is_empty());
+    }
+
+    #[test]
+    fn flags_runtime_source_builds() {
+        let build = |command: &str| {
+            let mut ctx = RuleContext::new("main.js", command, None);
+            classify_command(&mut ctx, Span::new(0, 0), command);
+            ctx.findings
+                .into_iter()
+                .find(|finding| finding.id == "shell.builds_remote_source")
+                .map(|finding| (finding.severity, finding.evidence))
+        };
+        // Fallback list of repos, unpinned.
+        let (severity, evidence) = build(
+            "for R in someone/compiler pawn-lang/compiler; do git clone --depth 1 \"https://github.com/$R\" /s && break; done\ncd /s && make",
+        )
+        .unwrap();
+        assert_eq!(severity, Severity::Medium);
+        assert!(
+            evidence.contains("https://github.com/someone/compiler"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.contains("https://github.com/pawn-lang/compiler"),
+            "{evidence}"
+        );
+        assert!(evidence.ends_with("(unpinned)"), "{evidence}");
+
+        // Pinned to a tag or a commit.
+        assert_eq!(
+            build("git clone -b v3.10.10 https://github.com/a/b /s && cd /s && make").map(|f| f.0),
+            Some(Severity::Low)
+        );
+        assert_eq!(
+            build(
+                "git clone https://github.com/a/b /s && git -C /s checkout 1a2b3c4d && make -C /s"
+            )
+            .map(|f| f.0),
+            Some(Severity::Low)
+        );
+        // A default branch is not a pin.
+        assert_eq!(
+            build("git clone --branch main https://github.com/a/b /s && cd /s && cmake .")
+                .map(|f| f.0),
+            Some(Severity::Medium)
+        );
+        // Package installs straight from git.
+        assert!(build("pip install git+https://github.com/a/b").is_some());
+        assert!(build("npm install github:a/b").is_some());
+        // Cloning without building, or building without cloning, is neither.
+        assert!(build("git clone https://github.com/a/b /s").is_none());
+        assert!(build("cd /s && make").is_none());
+    }
+
+    #[test]
+    fn recognises_script_shaped_constants() {
+        assert!(looks_like_shell_script("set -e\napk add git\ncd /x\nmake"));
+        assert!(!looks_like_shell_script("set -e"));
+        assert!(!looks_like_shell_script("Hello\nworld\nthis is text"));
     }
 
     #[test]
