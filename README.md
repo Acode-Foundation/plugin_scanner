@@ -113,9 +113,17 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
 - **Aggregation.** One finding per rule, stable key, and file, with an
   occurrence count and up to 8 locations.
 - **Endpoints are inventory.** URLs go into an `endpoints` list. Only known
-  exfiltration or payload hosts become findings: webhooks, request bins,
-  Telegram bot API, Apps Script, paste sites, tunnels, shorteners, raw public
-  IPs, `.onion`.
+  exfiltration or payload hosts become findings: request bins, paste sites,
+  tunnels, shorteners, raw public IPs, `.onion`. Telegram, Discord, Slack and
+  Apps Script URLs are High only when their secret (bot token, webhook id and
+  token, script id) is written into the plugin, since that channel belongs to
+  the author. Just the API base, with the token added at runtime from the
+  user's settings, is Low (`bot-api`). A Telegram bot token anywhere in a
+  string is `hardcoded_bot_token` (H), even when it is split from the URL.
+- **Own storage is not user data.** Reading a plugin's own `localStorage`
+  keys doesn't count toward exfiltration. Dumping all of it (`Object.keys`,
+  `JSON.stringify(localStorage)`, spreading it, `for…in`, `.key(i)`) is
+  `web_storage_dump` (M) and does.
 - **Base64 is decoded.** A long base64 string is only flagged when it decodes
   to JavaScript.
 
@@ -171,11 +179,11 @@ plugin as critical (`e.read()`, `n.copy()`, `window.cordova`, webpack's
 | Tampering | `core_module_override` (`acode.define("fs")` etc.) (C), `self_modify` (writes scripts or `plugin.json` where code is loaded from; C when the content is downloaded or it rewrites the entry/manifest, else H), `acode_api`, `cordova_bridge`, `network_hook`, `native_api` (hooks `system`, `Executor`, `sdcard`…), `dom_hook` (wraps `addEventListener`, `appendChild`, input `value`…), `ads`, `plugin_settings` (edits `pluginsDisabled`), `other_plugin`, `plugin_files` (writes into another plugin's folder), `rewards` (H), `editor_manager`, `define_dynamic`, `unmount_dynamic` (M) |
 | Dynamic code | `remote_code`, `remote_import` (C), `remote_script`, `remote_worker`, `decoded_exec`, `indirect_function_constructor` (H), `eval`, `function_constructor`, `inline_script`, `script_blob`, `html_script`, `remote_html`, `decoded_html` (M: `innerHTML`, `insertAdjacentHTML`, `createContextualFragment`, `srcdoc`, `on*` attributes), `string_timer`, `script_element`, `import_expression`, `inline_handler` (L) |
 | Acode API | `webview_remote_page` (M), `webview`, `webview_script`, `intent_module`, `intent_handler`, `require_dynamic` (L), `install_plugin` (M), `editor_hook`, `require_module`, `define_module`, `global_key_listener` (I) |
-| Network | `suspicious_endpoint` (H/M/L by host type), `remote_command`, `acode_account_write` (H: non-GET to `acode.app/api`, which Acode sends with the user's cookies), `acode_account_read` (M), `native_http`, `remote_storage`, `local_server`, `beacon` (M), `fetch`, `xhr`, `websocket`, `event_source`, `open_browser` (L) |
-| Filesystem / storage | `delete`, `sdcard_write`, `system_write`, `system_exec_bits`, `storage_access_request`, `cordova_file` (M), `write`, `sdcard_read`, `system_read`, `cookies`, `clipboard_read` (L), `read`, `module`, `plugin_dir`, `web_storage`, `indexeddb` (I) |
+| Network | `suspicious_endpoint` (H/M/L by host type), `hardcoded_bot_token` (H), `remote_command`, `acode_account_write` (H: non-GET to `acode.app/api`, which Acode sends with the user's cookies), `acode_account_read` (M), `native_http`, `remote_storage`, `local_server`, `beacon` (M), `fetch`, `xhr`, `websocket`, `event_source`, `open_browser` (L) |
+| Filesystem / storage | `delete`, `sdcard_write`, `system_write`, `system_exec_bits`, `storage_access_request`, `cordova_file`, `web_storage_dump` (M), `write`, `sdcard_read`, `system_read`, `cookies`, `clipboard_read` (L), `read`, `module`, `plugin_dir`, `web_storage`, `indexeddb` (I) |
 | Obfuscation | `obfuscator_tool`, `packer`, `jsfuck`, `encoded_js_payload` (H), `js.parse_failed`, `js.too_large`, `js.invalid_utf8` (M), `escaped_strings`, `hex_array` (L) |
 | WebAssembly | `remote_module` (H), `eval_import` (H, under dynamic code), `disguised`, `bad_magic`, `parse_failed` (M), `module`, `embedded_module` (L), `instantiate` (I) |
-| Correlation | `exfiltration` (C): reads user data (files, editor text, storage, clipboard, keys, acode.app account) and talks to a data-capture endpoint |
+| Correlation | `exfiltration` (C): reads user data (files, editor text, storage, clipboard, keys, acode.app account) and talks to a data-capture endpoint or a hardcoded bot token |
 
 Prefixes are omitted in the table; full IDs look like `shell.exec`.
 
@@ -185,7 +193,7 @@ Prefixes are omitted in the table; full IDs look like `shell.exec`.
 {
   "schema_version": 2,
   "scanner_version": "0.4.1",
-  "rules_version": "2026.11.2",        // rescan stored plugins when this changes
+  "rules_version": "2026.11.3",        // rescan stored plugins when this changes
   "plugin": { "id", "name", "version", "main", "entry", "permissions", "dependencies", ... },
   "verdict": { "risk": "high", "recommendation": "review", "complete": true, "reasons": ["..."] },
   "summary": { "total_findings", "by_severity", "by_category" },
